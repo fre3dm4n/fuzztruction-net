@@ -12,6 +12,9 @@ pub enum InputChannel {
     /// Input is consumed via a file. The argument that is replaced by the
     /// path to the input file must be marked with @@.
     File,
+    /// The applications uses network primitives (e.g., sockets for communication)
+    Tcp,
+    Udp,
 }
 
 /// The kind of output a program produces.
@@ -24,4 +27,7 @@ pub enum OutputChannel {
     /// Output is written into a file. The argument representing the file path
     /// is marked as §§.
     File,
+    /// The applications uses network primitives (e.g., sockets for communication)
+    Tcp,
+    Udp,
 }

@@ -1,21 +1,21 @@
 use crate::mem::MappedMemoryConfig;
 use core::panic;
+use fuzztruction_shared::abi;
 use fuzztruction_shared::constants::PATCH_POINT_SIZE;
-use fuzztruction_shared::dwarf::{DwarfReg, XMM_REGISTERS};
-use fuzztruction_shared::mutation_cache_entry::{MutationCacheEntry, MutationCacheEntryMetadata};
+use fuzztruction_shared::dwarf::DwarfReg;
+use fuzztruction_shared::mutation_cache_entry::MutationCacheEntry;
 use fuzztruction_shared::types::VAddr;
-use fuzztruction_shared::{abi, dwarf::GENERAL_PURPOSE_REGISTERS};
 use keystone::{Arch, Keystone, OptionType};
 use llvm_stackmap::LocationType;
 use proc_maps::MapRange;
 use std::collections::HashSet;
 use std::fmt::Debug;
+
+use std::str::FromStr;
 use std::sync::Mutex;
 
 use libc;
 use std::{collections::HashMap, slice};
-
-use memoffset::offset_of;
 
 use super::util;
 use crate::agent::{update_proc_mappings, PROC_MAPPINGS};
@@ -29,7 +29,7 @@ macro_rules! MiB {
 }
 
 const DEFAULT_CODE_CACHE_SIZE: usize = MiB!(64);
-const CALL_DST_REG: DwarfReg = DwarfReg::R11;
+const NOP_PATTERN: &[u8; 32] = b"\x66\x66\x66\x66\x66\x2e\x66\x0f\x1f\x84\x00\x00\x02\x00\x00\x66\x66\x66\x66\x66\x2e\x66\x0f\x1f\x84\x00\x00\x02\x00\x00\x66\x90";
 
 #[derive(Debug, Clone, Copy)]
 /// An argument that is passed to a function.
@@ -245,6 +245,10 @@ impl FunctionInstance {
             self
         );
         assert!(self.machine_code.len() > 0);
+
+        let patchpoint_byte = slice::from_raw_parts(dst_addr.0 as *mut u8, 32);
+        assert_eq!(NOP_PATTERN, patchpoint_byte);
+
         self.vma = Some(dst_addr);
         std::ptr::copy_nonoverlapping(
             [0x90; PATCH_POINT_SIZE].as_ptr(),
@@ -279,9 +283,8 @@ impl CallableFunction for FunctionInstance {
 pub struct FunctionTemplate {
     /// The assembler code this function is made of.
     asm_body: Vec<String>,
-    /// Whether this function might be called and therefore need a ret instruction.
-    /// E.g., if a function gets inlined, this must be false.
-    is_callee: bool,
+    /// Does this function return or is it inlined?
+    returns: bool,
 }
 
 //asm_body, is_callee
@@ -290,25 +293,34 @@ lazy_static! {
 }
 
 impl FunctionTemplate {
-    pub fn new(asm_body: Vec<String>, is_callee: bool) -> FunctionTemplate {
+    pub fn new(asm_body: Vec<String>, returns: bool) -> FunctionTemplate {
         FunctionTemplate {
             asm_body: asm_body,
-            is_callee,
+            returns,
         }
     }
 
     fn assemble(self, ks: &Keystone) -> Option<(Vec<String>, Vec<u8>)> {
         let mut asm = self.asm_body;
 
-        if self.is_callee {
+        if self.returns {
             asm.push("ret".to_owned());
         }
 
         // Assemble
         let asm_str = asm.join("\n");
+        //log::trace!("Assembling asm:\n{}", asm_str);
+
         //eprintln!("Assembling:\n-----\n{}\n-----", &asm_str);
         let res = ks.asm(asm_str, 0);
-        //eprintln!("res={:#?}", res);
+        if let Ok(bytes) = &res {
+            let mut hex = String::from_str("asm_result:\n").unwrap();
+            for byte in &bytes.bytes {
+                hex.push_str(&format!("\\x{:x}", byte));
+            }
+            //log::trace!("{}", hex);
+        }
+
         match res {
             Err(e) => {
                 log::error!("Error while assembling {}", e);
@@ -491,14 +503,16 @@ impl<'a> Jit<'a> {
         assert!(target_fns.len() > 0);
         let mut asm_body = Vec::new();
 
-        asm_body.push(format!("push {}", CALL_DST_REG.name()));
-
         for f in target_fns.iter() {
-            asm_body.push(format!("movabs {}, 0x{:x}", CALL_DST_REG.name(), f.vma().0));
-            asm_body.push(format!("call {}", CALL_DST_REG.name()));
+            asm_body.extend_from_slice(&[
+                "push rax".to_owned(),
+                format!("mov rax, 0x{:x}", f.vma().0),
+                "push rax".to_owned(),
+                "mov rax, [rsp+8]".to_owned(),
+                "call [rsp]".to_owned(),
+                "add rsp, 0x10".to_owned(),
+            ]);
         }
-
-        asm_body.push(format!("pop {}", CALL_DST_REG.name()));
 
         let template = FunctionTemplate::new(asm_body, true);
         template
@@ -510,15 +524,13 @@ impl<'a> Jit<'a> {
         &self,
         to: &impl CallableFunction,
         args: Vec<FunctionArg>,
-        is_callee: bool,
+        returns: bool,
         trashed_regs: Option<Vec<DwarfReg>>,
     ) -> FunctionTemplate {
         let mut asm_body = Vec::new();
         let mut abi_args_order = abi::ARGUMENT_PASSING_ORDER.iter();
 
         let mut trashed_regs = trashed_regs.unwrap_or(Vec::new());
-        // Used below to call `to`.
-        trashed_regs.push(CALL_DST_REG);
 
         // Parse args to the called function, if any.
         for arg in args {
@@ -540,227 +552,158 @@ impl<'a> Jit<'a> {
             asm_body.insert(0, format!("push {}", reg.name()));
         }
 
-        // Place the callee's address into `CALL_DST_REG`.
-        asm_body.push(format!(
-            "movabs {}, 0x{:x}",
-            CALL_DST_REG.name(),
-            to.vma().0
-        ));
-
-        // The actual call.
-        asm_body.push(format!("call {}", CALL_DST_REG.name()));
+        asm_body.extend_from_slice(&[
+            "nop".to_owned(),
+            "nop".to_owned(),
+            "nop".to_owned(),
+            "nop".to_owned(),
+            "push rax".to_owned(),
+            format!("mov rax, 0x{:x}", to.vma().0),
+            "push rax".to_owned(),
+            "mov rax, [rsp+8]".to_owned(),
+            "call [rsp]".to_owned(),
+            "add rsp, 0x10".to_owned(),
+        ]);
 
         // Restore the trashed registers after the call returns.
         for reg in trashed_regs.iter() {
             asm_body.push(format!("pop {}", reg.name()));
         }
 
-        FunctionTemplate::new(asm_body, is_callee)
+        FunctionTemplate::new(asm_body, returns)
     }
 
     /// Generate a mutation stub for a `MutationCacheEntry` that
-    /// directly targets a register.
-    fn gen_mutation_reg(
+    /// mutates a stack slot.
+    fn gen_mutation_reg_and_direct(
         &self,
         mce: &MutationCacheEntry,
-        is_callee: bool,
     ) -> Result<FunctionTemplate, JitError> {
-        //eprintln!("gen_mutation_gpr_xmm: reg={:#?}, mce: {:#?}", reg, mce);
         let mut asm = Vec::<String>::new();
+        let spill_reg: DwarfReg = mce.spill_slot().dwarf_regnum.try_into().unwrap();
+        assert_ne!(
+            spill_reg,
+            DwarfReg::Rsp,
+            "RSP is changed in our caller, so this is currently not supported"
+        );
 
-        let is_xmm = XMM_REGISTERS.contains(&mce.dwarf_regnum());
-        let loc_size = mce.loc_size();
-        let chunk_size = if loc_size <= 8 { loc_size } else { 8 };
+        // Number of bits read each time this mutation is executed.
+        let chunk_size_bits = mce.chunk_size_bits();
+        let mut chunk_size_bytes_ceiled = chunk_size_bits.div_ceil(8);
 
-        let msk_reg = DwarfReg::Rdx.name_with_size(chunk_size as u8).unwrap();
-        let target_reg = match loc_size {
-            4 => {
-                // We use the super register (e.g., EAX -> RAX) if we have
-                // a 4 byte target, because applying the mask down below with
-                // xor EAX, [msk] causes the upper for bytes to be cleared
-                // which is not intended. This only works if the msk buffer
-                // contain 4 trailing zero bytes that can be "used" as msk for
-                // the upper 4 bytes that we actually do not want to mutate.
-                mce.dwarf_regnum().name()
-            }
-            _ => mce
-                .dwarf_regnum()
-                .name_with_size(mce.loc_size() as u8)
-                .unwrap(),
-        };
-
-        let offset = offset_of!(MutationCacheEntryMetadata, dwarf_regnum);
-        let t = mce as *const MutationCacheEntry as *const u8 as usize;
-        let t = t + offset;
-        let t = t as *const u16;
-        let t = unsafe { std::ptr::read(t) };
-
-        assert!(mce.dwarf_regnum() as u16 == t);
-
-        // Stack slot for spilling the mutation mask.
-        if is_xmm {
-            asm.push(format!("push 0"));
-            asm.push(format!("push 0"));
-        } else {
-            asm.push(format!("push 0"));
-        }
-
-        // Scratch registers
-        asm.push(format!("push rax"));
-        asm.push(format!("push rbx"));
-        asm.push(format!("push rcx"));
-        asm.push(format!("push rdx")); // used for msk
-
-        asm.push(format!(
-            "mov rax, 0x{:x}",
-            mce as *const MutationCacheEntry as u64
-        ));
-
-        asm.push(format!(
-            "mov ebx, [rax + 0x{:x}]",
-            offset_of!(MutationCacheEntryMetadata, read_pos)
-        ));
-
-        // Load the mask value into stack slot
-        asm.push(format!(
-            "mov {}, [rax + rbx + 0x{:x}]",
-            &msk_reg,
-            offset_of!(MutationCacheEntry, msk)
-        ));
-        asm.push(format!("mov [rsp+0x20], {}", &msk_reg));
-
-        if is_xmm {
-            asm.push(format!(
-                "mov {}, [rax + rbx + 0x{:x}]",
-                &msk_reg,
-                offset_of!(MutationCacheEntry, msk) + 8
-            ));
-            asm.push(format!("mov [rsp+0x28], {}", &msk_reg));
-        }
-
-        // Current register content
-        // RAX = base,
-        // EBX = read_pos
-        // RCX = free
-        // RDX = msk_reg
-
-        // increment read_pos
-        asm.push(format!("add ebx, 0x{:x}", loc_size));
-
-        // rcx = msk_len
-        asm.push(format!(
-            "mov ecx, [rax + 0x{:x}]",
-            MutationCacheEntry::offsetof_msk_len(),
-        ));
-
-        // cmp read_pos, msk_len
-        asm.push(format!("cmp ebx, ecx"));
-
-        // set read_pos = msk_len if (read_pos > msk_len)
-        asm.push(format!("cmova ebx, ecx"));
-
-        // Update the read_pos in the struct
-        asm.push(format!(
-            "mov dword [rax + 0x{:x}], ebx",
-            offset_of!(MutationCacheEntryMetadata, read_pos),
-        ));
-
-        asm.push(format!("pop rdx"));
-        asm.push(format!("pop rcx"));
-        asm.push(format!("pop rbx"));
-        asm.push(format!("pop rax"));
-
-        // We need here all registers in their untouched state, since
-        // we possibly mutate a register that we used in the code above.
-        // Hence, we store the mask temporarily onto the stack before appling it.
-        if is_xmm {
-            asm.push(format!("xorps {}, xmmword [rsp]", target_reg));
-            asm.push(format!("add rsp, 0x10"));
-        } else {
-            asm.push(format!("xor {}, [rsp]", target_reg));
-            asm.push(format!("add rsp, 0x8"));
-        }
-
-        Ok(FunctionTemplate::new(asm, is_callee))
-    }
-
-    fn gen_mutation_indirect(
-        &self,
-        mce: &MutationCacheEntry,
-        is_callee: bool,
-    ) -> Result<FunctionTemplate, JitError> {
-        //log::trace!("gen_mutation_indirect_gpr: {:#?}", mce);
-        let mut asm = Vec::<String>::new();
-
-        if mce.loc_size() > 8 && mce.loc_size() != 16 {
+        if chunk_size_bits > (8 * 8) {
             return Err(JitError::UnsupportedMutation(format!(
-                "Unsupported size {} for indirect gpr",
-                mce.loc_size()
+                "Chunks with size > 8 byte are currently not supported {:#?}",
+                mce
             )));
         }
-        let loc_size = mce.loc_size();
-        let loc_size_is_16 = loc_size == 16;
-        let chunk_size = if loc_size_is_16 { 8 } else { loc_size };
 
-        let msk_reg = DwarfReg::Rdx.name_with_size(chunk_size as u8).unwrap();
-
-        let offset = offset_of!(MutationCacheEntryMetadata, dwarf_regnum);
-        let t = mce as *const MutationCacheEntry as *const u8 as usize;
-        let t = t + offset;
-        let t = t as *const u16;
-        let t = unsafe { std::ptr::read(t) };
-
-        assert!(mce.dwarf_regnum() as u16 == t);
-
-        // Stack slot for spilling the mutation mask.
-        asm.push(format!("push 0"));
-
-        if loc_size_is_16 {
-            asm.push(format!("push 0"));
+        // if we read more than 1 bit and the amount is not byte aligned we are reading
+        // one extra byte to account for chunks spanning two bytes.
+        // If we have reached the end of the mask, this will probably over read,
+        //  but the mask's trailing memory is guarded by our read overflow area.
+        // (see fuzztruction_shared/src/mutation_cache_entry.rs:79)
+        if chunk_size_bits != 1 && chunk_size_bits % 8 != 0 {
+            chunk_size_bytes_ceiled += 1;
+            assert!(chunk_size_bytes_ceiled.div_ceil(8) <= 8);
         }
+
+        // Make it match register sizes
+        let chunk_size_bytes_ceiled = chunk_size_bytes_ceiled.next_power_of_two();
+        assert!(chunk_size_bytes_ceiled <= 8);
+
+        // Pointer to the spilled value
+        let spill_slot_ptr_reg = DwarfReg::try_from(mce.spill_slot().dwarf_regnum).unwrap();
 
         // Scratch registers
         asm.push(format!("push rax"));
         asm.push(format!("push rbx"));
         asm.push(format!("push rcx"));
-        asm.push(format!("push rdx")); // used for msk
+        asm.push(format!("push rdx"));
+        asm.push(format!("push r11"));
 
+        // Make sure we backup the stack slot pointer, since this could also be one
+        // of the registers above (that we are going to clobber).
+        asm.push(format!("push {}", spill_slot_ptr_reg.name()));
+
+        // rax = &MutationCacheEntry
         asm.push(format!(
             "mov rax, 0x{:x}",
             mce as *const MutationCacheEntry as u64
         ));
 
+        // rbx = read_pos_bits
         asm.push(format!(
             "mov ebx, [rax + 0x{:x}]",
-            offset_of!(MutationCacheEntryMetadata, read_pos)
+            MutationCacheEntry::read_pos_bits_offset()
         ));
+
+        // rdx = read_pos_bits
+        asm.push(format!("mov rdx, rbx"));
+
+        // rdx = read_pos_bits // 8
+        asm.push(format!("shr rdx, 3"));
+
+        // rcx = read_pos_bits
+        asm.push(format!("mov rcx, rbx"));
+
+        // rcx = read_pos_bits % 8
+        asm.push(format!("and rcx, 0x7"));
 
         // Load the mask value into stack slot
-        asm.push(format!(
-            "mov {}, [rax + rbx + 0x{:x}]",
-            &msk_reg,
-            offset_of!(MutationCacheEntry, msk)
-        ));
-        asm.push(format!("mov [rsp+0x20], {}", &msk_reg));
+        let msk_value_reg = DwarfReg::R11;
+        //asm.push(format!("mov {}, 0x0", msk_value_reg.name()));
 
-        if loc_size_is_16 {
-            // Load the mask value into stack slot
-            asm.push(format!(
-                "mov {}, [rax + rbx + 0x{:x}]",
-                &msk_reg,
-                offset_of!(MutationCacheEntry, msk) + 8
-            ));
-            asm.push(format!("mov [rsp+0x28], {}", &msk_reg));
+        let msk_value_reg_str = msk_value_reg
+            .name_with_size(chunk_size_bytes_ceiled as u8)
+            .unwrap();
+
+        // read chunk_size many bits
+        // msk_value_reg = msk_value
+        asm.push(format!(
+            "mov {}, {} [rax + rdx + 0x{:x}]",
+            msk_value_reg_str,
+            DwarfReg::mem_ptr_prefix(chunk_size_bytes_ceiled as usize),
+            MutationCacheEntry::msk_start_offset()
+        ));
+
+        // Shift out bits that were already read
+        asm.push(format!("shr {}, cl", msk_value_reg.name()));
+
+        // Load the reg of the spill slot
+        asm.push(format!("mov rdx, [rsp]"));
+
+        if mce.spill_slot().loc_type == LocationType::Direct {
+            let offset = mce.spill_slot().offset_or_constant;
+            if offset > 0 {
+                asm.push(format!("add rdx, 0x{:x}", offset));
+            } else if offset < 0 {
+                asm.push(format!("sub rdx, 0x{:x}", offset * -1));
+            }
+        }
+
+        match chunk_size_bits {
+            v if v % 8 == 0 => {
+                asm.push(format!("xor [rdx], {}", msk_value_reg_str));
+            }
+            v => {
+                asm.push(format!(
+                    "and {}, 0x{:x}",
+                    msk_value_reg_str,
+                    (1u32 << v) - 1
+                ));
+                asm.push(format!("xor [rdx], {}", msk_value_reg_str));
+            }
         }
 
         // Current register content
-        // RAX = base,
-        // EBX = read_pos
-        // RCX = free
-        // RDX = msk_reg
+        // rax = mce base,
+        // ebx = read_pos
+        // rcx = free
+        // rdx = free
 
         // increment read_pos
-        asm.push(format!("add ebx, 0x{:x}", loc_size));
+        asm.push(format!("add ebx, 0x{:x}", chunk_size_bits));
 
         // rcx = msk_len
         asm.push(format!(
@@ -768,7 +711,10 @@ impl<'a> Jit<'a> {
             MutationCacheEntry::offsetof_msk_len(),
         ));
 
-        // cmp read_pos, msk_len
+        // rcx = msk_len * 8
+        asm.push(format!("shl ecx, 3"));
+
+        // cmp read_pos_bits, msk_len_bits
         asm.push(format!("cmp ebx, ecx"));
 
         // set read_pos = msk_len if (read_pos > msk_len)
@@ -777,103 +723,27 @@ impl<'a> Jit<'a> {
         // Update the read_pos in the struct
         asm.push(format!(
             "mov dword [rax + 0x{:x}], ebx",
-            offset_of!(MutationCacheEntryMetadata, read_pos),
+            MutationCacheEntry::read_pos_bits_offset()
         ));
 
+        asm.push(format!("pop {}", spill_slot_ptr_reg.name()));
+        asm.push(format!("pop r11"));
         asm.push(format!("pop rdx"));
         asm.push(format!("pop rcx"));
         asm.push(format!("pop rbx"));
         asm.push(format!("pop rax"));
 
-        // The ptr to the value we want to mutate is at [dwarf_regnum + offset_or_constant].
-        let ptr_base_reg = mce.dwarf_regnum();
-        let ptr_base_reg8 = ptr_base_reg.name_with_size(8).unwrap();
-
-        let mut useable_regs = GENERAL_PURPOSE_REGISTERS
-            .iter()
-            .filter(|r| **r != ptr_base_reg && **r != DwarfReg::Rsp)
-            .collect::<Vec<_>>();
-        let ptr_reg = useable_regs.pop().unwrap();
-        let ptr_reg8 = ptr_reg.name_with_size(8).unwrap();
-        let msk_reg = useable_regs.pop().unwrap();
-
-        asm.push(format!("push {}", ptr_reg8));
-        asm.push(format!("push {}", msk_reg.name_with_size(8).unwrap()));
-        asm.push(format!(
-            "lea {}, [{} + {}]",
-            ptr_reg8, ptr_base_reg8, mce.metadata.offset_or_constant
-        ));
-
-        // ! It look like keystone fails to parse 16 instead of 0x10 correctly !
-        asm.push(format!(
-            "mov {}, [rsp + 0x10]",
-            msk_reg.name_with_size(8).unwrap()
-        ));
-        asm.push(format!(
-            "xor [{}], {}",
-            ptr_reg8,
-            msk_reg.name_with_size(chunk_size as u8).unwrap()
-        ));
-
-        if loc_size_is_16 {
-            asm.push(format!(
-                "mov {}, [rsp + 0x18]",
-                msk_reg.name_with_size(8).unwrap()
-            ));
-            asm.push(format!("add {}, 8", ptr_reg8));
-            asm.push(format!(
-                "xor [{}], {}",
-                ptr_reg8,
-                msk_reg.name_with_size(chunk_size as u8).unwrap()
-            ));
-        }
-
-        asm.push(format!("pop {}", msk_reg.name_with_size(8).unwrap()));
-        asm.push(format!("pop {}", ptr_reg8));
-
-        if loc_size_is_16 {
-            asm.push(format!("add rsp, 0x10"));
-        } else {
-            asm.push(format!("add rsp, 0x8"));
-        }
-
-        //eprintln!("asm={:#?}", asm);
-
-        Ok(FunctionTemplate::new(asm, is_callee))
+        //log::trace!("Target: {:#?}\nASM:\n{}", mce, asm.join("\n"));
+        Ok(FunctionTemplate::new(asm, true))
     }
 
-    pub fn gen_mutation(
-        &self,
-        mce: &MutationCacheEntry,
-        is_callee: bool,
-    ) -> Result<FunctionTemplate, JitError> {
+    /// Generate an assembler template that implements everything necessary to apply the mutations to the values in the `mce`.`
+    pub fn gen_mutation(&self, mce: &MutationCacheEntry) -> Result<FunctionTemplate, JitError> {
         assert!(mce.msk_len() > 0);
-
-        let reg = mce.dwarf_regnum();
-
-        match mce.loc_type() {
-            LocationType::Register => match reg {
-                _ if GENERAL_PURPOSE_REGISTERS.contains(&reg) || XMM_REGISTERS.contains(&reg) => {
-                    return self.gen_mutation_reg(mce, is_callee)
-                }
-                _ => {
-                    return Err(JitError::UnsupportedMutation(format!(
-                        "Unable to handle register: {:#?}",
-                        mce
-                    )));
-                }
-            },
-            LocationType::Indirect => match reg {
-                _ if GENERAL_PURPOSE_REGISTERS.contains(&reg) => {
-                    return self.gen_mutation_indirect(mce, is_callee)
-                }
-                _ => {
-                    return Err(JitError::UnsupportedMutation(format!(
-                        "Unable to handle register: {:#?}",
-                        mce
-                    )));
-                }
-            },
+        match mce.spill_slot().loc_type {
+            LocationType::Register | LocationType::Direct => {
+                return self.gen_mutation_reg_and_direct(mce);
+            }
             _ => Err(JitError::UnsupportedMutation(format!(
                 "Unsupported location type: {:#?}",
                 mce

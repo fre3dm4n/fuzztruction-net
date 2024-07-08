@@ -1,8 +1,11 @@
 use std::{
     cell::RefCell,
     fs,
+    io::Write,
+    mem,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use fuzztruction_shared::mutation_cache::MutationCache;
@@ -38,7 +41,7 @@ impl FuzzingWorker {
     /// Using this function and execution the source with the input provided
     /// via [QueueEntry::input()] can be used to reproduce the behavior observed
     /// during creation of `entry`.
-    pub(super) fn load_queue_entry_mutations(&mut self, entry: &QueueEntry) -> Result<()> {
+    pub(super) unsafe fn load_queue_entry_mutations(&mut self, entry: &QueueEntry) -> Result<()> {
         let source = &mut self.source.as_mut().unwrap();
         let mutations = entry.mutations();
 
@@ -59,9 +62,7 @@ impl FuzzingWorker {
     /// Store `sink_input` in the `interesting` directory using its SHA256
     /// hash as its name.
     pub(super) fn maybe_save_interesting_input(&self, sink_input: &[u8]) {
-        let mut digest = Sha256::new();
-        digest.update(sink_input);
-        let sha256_digest: String = digest.finalize().encode_hex();
+        let sha256_digest: String = get_slice_digest(sink_input);
         let stats_lock = self.stats.lock().unwrap();
         let ts = stats_lock.init_ts;
         let filename = format!(
@@ -78,16 +79,60 @@ impl FuzzingWorker {
 
     /// Store `sink_input` in the `crashing` directory using its SHA256
     /// hash and the signal name as filename.
-    pub(super) fn save_crashing_input(&self, sink_input: &[u8], signal: Signal) {
-        let mut digest = Sha256::new();
-        digest.update(sink_input);
-        let sha256_digest: String = digest.finalize().encode_hex();
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    pub(super) fn save_crashing_input_and_asan_ubsan_report(
+        &mut self,
+        sink_input: &[u8],
+        signal: Signal,
+        qe: Option<Arc<QueueEntry>>,
+    ) {
+        let queue_entry_id = qe
+            .map(|q| q.id().0.to_string())
+            .unwrap_or("none".to_owned());
+        let sha256_digest = get_slice_digest(sink_input);
+
+        let stats_lock = self.stats.lock().unwrap();
+        let ts = stats_lock.init_ts;
+        mem::drop(stats_lock);
 
         let mut path = self.crashing_inputs.clone();
-        let name = format!("ts:{}+hash:{}+sig:{}", ts.as_secs(), sha256_digest, signal);
-        path.push(name);
+        let prefix = format!(
+            "ts:{}+hash:{}+queue_entry:{}+sig:{}",
+            ts.unwrap().elapsed().as_millis(),
+            sha256_digest,
+            queue_entry_id,
+            signal
+        );
+        let name = format!("{}.input", prefix);
+        path.push(&name);
         fs::write(&path, sink_input).unwrap();
+
+        let sink = self.sink.as_mut().unwrap();
+        if let Some(report_content) = sink.get_latest_asan_report() {
+            let mut report_path = self.asan_reports.clone();
+            let name = format!("{}.asan", prefix);
+            report_path.push(name);
+            fs::write(report_path, &report_content).unwrap();
+
+            let symbolized_report = symbolize_report(report_content);
+
+            let report_symbolized = format!("{}.asan_symbolized", prefix);
+            let mut path = self.asan_reports.clone();
+            path.push(report_symbolized);
+            fs::write(path, symbolized_report).unwrap();
+        }
+        // if let Some(report_content) = sink.get_latest_ubsan_report() {
+        //     let mut path = self.ubsan_reports.clone();
+        //     let name = format!("{}.ubsan", prefix);
+        //     path.push(name);
+        //     fs::write(path, &report_content).unwrap();
+
+        //     let symbolized_report = symbolize_report(report_content);
+
+        //     let name = format!("{}.ubsan_symbolized", prefix);
+        //     let mut path = self.ubsan_reports.clone();
+        //     path.push(name);
+        //     fs::write(path, symbolized_report).unwrap();
+        // }
     }
 
     /// Trace the given `QueueEntry` if it does not contain a trace.
@@ -106,17 +151,23 @@ impl FuzzingWorker {
             log::info!("Entry is already traced by another thread. Skipping");
             return Ok(None);
         }
+
+        log::info!("Tracing entry, this may take some minutes");
         stats_rw_guard.mark_tracing_in_progress();
         drop(stats_rw_guard);
 
         let start_ts = Instant::now();
-        self.load_queue_entry_mutations(entry)?;
+        unsafe {
+            self.load_queue_entry_mutations(entry)?;
+        }
         let input = entry.input();
         let data = input.data();
         let mut buf = Vec::new();
+
         let trace = common_trace(
             &self.config,
             self.source.as_mut().unwrap(),
+            self.sink.as_mut().unwrap(),
             data,
             self.config.general.tracing_timeout,
             &mut buf,
@@ -161,4 +212,30 @@ impl FuzzingWorker {
         }
         has_new_bits
     }
+}
+
+fn symbolize_report(report: String) -> String {
+    let mut cmd = Command::new("python3");
+    cmd.args([
+        "/home/user/fuzztruction/lib/asan_symbolize.py",
+        "--demangle",
+    ]);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(report.as_bytes())
+        .unwrap();
+    let symbolized_report = child.wait_with_output().unwrap();
+    String::from_utf8(symbolized_report.stdout).unwrap()
+}
+
+fn get_slice_digest(sink_input: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(sink_input);
+    let sha256_digest: String = digest.finalize().encode_hex();
+    sha256_digest
 }

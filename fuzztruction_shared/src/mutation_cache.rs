@@ -11,10 +11,10 @@ use thiserror::Error;
 
 use crate::{
     constants::ENV_SHM_NAME, mutation_cache_content::MutationCacheContent,
-    mutation_cache_entry::MutationCacheEntry, types::PatchPointID, util,
+    mutation_cache_entry::MutationCacheEntry, types::MutationSiteID, util,
 };
 
-pub const MUTATION_CACHE_DEFAULT_SIZE: usize = n_mib_bytes!(64) as usize;
+pub const MUTATION_CACHE_DEFAULT_SIZE: usize = n_mib_bytes!(256) as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -236,7 +236,7 @@ impl MutationCache {
                 ));
             }
 
-            // Check alignment. Implment logging and sanitize messages
+            // Check alignment.
             let l = alloc::Layout::new::<MutationCacheContent>();
             assert!(mapping as usize % l.align() == 0);
 
@@ -365,9 +365,10 @@ impl MutationCache {
         self.content_mut().push(entry)
     }
 
-    /// Remove the [MutationCacheEntry] with the given `di` .
-    /// !!! This will invalidate all references to the cached entries !!!
-    pub fn remove(&mut self, id: PatchPointID) {
+    /// Remove the [MutationCacheEntry] with the given `id` .
+    /// # Safety
+    /// This will invalidate all pointers into the cache.
+    pub unsafe fn remove(&mut self, id: MutationSiteID) {
         self.content_mut().remove(id)
     }
 
@@ -393,9 +394,15 @@ impl MutationCache {
         Ok(())
     }
 
-    pub fn save_bytes(&mut self) -> Vec<u8> {
+    pub unsafe fn save_bytes(&mut self) -> Vec<u8> {
         // Remove whiteouts to reduce size
         self.content_mut().consolidate();
+        let content_meta = self.content();
+        // Only copy bytes that actually contain information.
+        self.content_slice()[0..content_meta.total_used_bytes()].to_vec()
+    }
+
+    pub unsafe fn save_bytes_unconsolidated(&mut self) -> Vec<u8> {
         let content_meta = self.content();
         // Only copy bytes that actually contain information.
         self.content_slice()[0..content_meta.total_used_bytes()].to_vec()
@@ -413,7 +420,7 @@ impl MutationCache {
         Ok(ret)
     }
 
-    pub fn replace(&mut self, other: &MutationCache) -> Result<()> {
+    pub fn replace_content(&mut self, other: &MutationCache) -> Result<()> {
         if self.content_size < other.content_size {
             Err(MutationCacheError::CacheOverflow)
                 .context("Can not replace cache content with content from a larger cache.")?
@@ -436,7 +443,9 @@ impl MutationCache {
 
     /// Removes all elements from the cache that are not listed in the passed
     /// whitelist.
-    fn retain_whitelisted(&mut self, whitelist: &[PatchPointID]) {
+    /// Safety:
+    /// This will invalidate all pointers into the cache.
+    unsafe fn retain_whitelisted(&mut self, whitelist: &[MutationSiteID]) {
         let remove = self
             .entries()
             .iter()
@@ -447,8 +456,11 @@ impl MutationCache {
     }
 
     /// Only retain elements for which `f` returns true.
-    /// !!! This will invalidate all references to the contained entries !!!
-    pub fn retain<F>(&mut self, mut f: F)
+    /// Safety:
+    /// This will invalidate all pointers into the cache.
+    /// Safety:
+    /// This will invalidate all pointers into the cache.
+    pub unsafe fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut(&MutationCacheEntry) -> bool,
     {
@@ -460,8 +472,9 @@ impl MutationCache {
     }
 
     /// Only retain MutationCacheEntry's that actually affect the execution.
-    /// !!! This will invalidate all references to the contained entries !!!
-    pub fn purge_nop_entries(&mut self) {
+    /// Safety:
+    /// This will invalidate all pointers into the cache.
+    pub unsafe fn purge_nop_entries(&mut self) {
         let mut entries = self.entries();
         entries.retain(|e| e.msk_len() > 0 && e.get_msk_as_slice().iter().any(|e| *e != 0));
         let wl = entries.iter().map(|e| e.id()).collect::<Vec<_>>();
@@ -477,7 +490,11 @@ impl MutationCache {
         self.entries_mut().into_iter()
     }
 
-    pub fn union_and_replace(&mut self, other: &MutationCache) {
+    /// Copy all entries from `other` into `self` while replacing those in self that are
+    /// also contained in other.
+    /// Safety:
+    /// This will invalidate all pointers into the cache.
+    pub unsafe fn union_and_replace(&mut self, other: &MutationCache) {
         let other_ids = other.iter().map(|e| e.id()).collect::<HashSet<_>>();
         // Remove entries from self that are also in other.
         self.retain(|e| !other_ids.contains(&e.id()));
@@ -521,13 +538,17 @@ impl MutationCache {
     }
 
     /// Remove all mutation entries that have the passed LocationType.
-    pub fn remove_by_location_type(&mut self, loc_type: LocationType) -> &mut Self {
-        self.retain(|e| e.loc_type() != loc_type);
+    /// Safety:
+    /// This will invalidate all pointers into the cache.
+    pub unsafe fn remove_by_location_type(&mut self, loc_type: LocationType) -> &mut Self {
+        self.retain(|e| e.spill_slot().loc_type != loc_type);
         self
     }
 
-    /// Purge all expect `max` elements from the cache.
-    pub fn limit(&mut self, max: usize) -> &mut Self {
+    /// Purge all except `max` elements from the cache.
+    /// Safety:
+    /// This will invalidate all pointers into the cache.
+    pub unsafe fn limit(&mut self, max: usize) -> &mut Self {
         let mut limit = max;
         self.retain(|_e| {
             if limit > 0 {
@@ -542,7 +563,9 @@ impl MutationCache {
 
     /// Remove all mutation entries that are of type LocationType::Constant and therefore
     /// are not associated to any live value we might mutate.
-    pub fn remove_const_type(&mut self) -> &mut Self {
+    /// Safety:
+    /// This will invalidate all pointers into the cache.
+    pub unsafe fn remove_const_type(&mut self) -> &mut Self {
         self.remove_by_location_type(LocationType::Constant);
         self
     }
@@ -565,8 +588,116 @@ impl MutationCache {
     }
 }
 
+#[cfg(test)]
 mod test {
+    use std::{
+        mem,
+        sync::atomic::{self, AtomicU64},
+    };
+
+    use crate::{mutation_cache_entry::MutationCacheEntry, types::MutationSiteID};
+
+    use super::MutationCache;
+
+    static MCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    fn get_unique_mce() -> Box<MutationCacheEntry> {
+        let next_id = MCE_COUNTER.fetch_add(1, atomic::Ordering::SeqCst);
+        let loc = unsafe { mem::zeroed() };
+        let mce = MutationCacheEntry::new(
+            MutationSiteID::get(next_id as usize, 0, 0),
+            llvm_stackmap::LLVMInstruction::AShr,
+            0xbffffffffffffffa,
+            0xc,
+            loc,
+            0xd,
+            next_id as u32 % 512,
+        );
+        mce.get_msk_as_slice()
+            .iter_mut()
+            .for_each(|b| *b = next_id as u8);
+        mce
+    }
+
+    fn assert_mutation_cache_eq(mc1: &MutationCache, mc2: &MutationCache) {
+        assert_eq!(mc1.len(), mc2.len());
+        for entry in mc1.entries() {
+            let matching_entries = mc2.entries().iter().filter(|e| **e == entry).count();
+            assert_eq!(matching_entries, 1);
+        }
+    }
 
     #[test]
-    fn test() {}
+    fn test_new() {
+        let _mc = MutationCache::new().unwrap();
+    }
+
+    #[test]
+    fn test_content_bounds() {
+        let mut mc1 = MutationCache::new().unwrap();
+        let content = mc1.content_slice_mut();
+        assert_eq!(mc1.content_size, content.len());
+
+        for _ in 0..2000 {
+            let mce = get_unique_mce();
+            mc1.content_mut().push(&mce);
+        }
+
+        let bytes = unsafe { mc1.save_bytes_unconsolidated() };
+        let mut mc2 = MutationCache::new().unwrap();
+        mc2.load_bytes(&bytes).unwrap();
+
+        assert_mutation_cache_eq(&mc1, &mc2);
+    }
+
+    #[test]
+    fn test_entry_bounds() {
+        let mut mc1 = MutationCache::new().unwrap();
+        for _ in 0..2000 {
+            let mce = get_unique_mce();
+            mc1.content_mut().push(&mce);
+        }
+
+        let mc2 = mc1.try_clone().unwrap();
+
+        // Write bytes into each msk byte
+        for entry in mc1.entries_mut() {
+            let msk = entry.get_msk_as_slice();
+            if !msk.is_empty() {
+                let msk_val = msk[0];
+                msk.iter_mut().for_each(|b| *b = msk_val);
+            }
+        }
+
+        // check if the writes above overflowed into some neighboring entry.
+        assert_mutation_cache_eq(&mc1, &mc2);
+    }
+
+    #[test]
+    fn test_clone_boxed() {
+        let mut mc1 = MutationCache::new().unwrap();
+        let mut expected_mces = Vec::new();
+        for _ in 0..2000 {
+            let mce = get_unique_mce();
+            mc1.content_mut().push(&mce);
+            expected_mces.push(mce);
+        }
+
+        let mc2 = mc1.try_clone().unwrap();
+        assert_eq!(mc1.content_slice(), mc2.content_slice());
+    }
+
+    #[test]
+    fn test_shm() {
+        let mut mc1 = MutationCache::shm_open("test", true).unwrap();
+        let mut expected_mces = Vec::new();
+
+        for _ in 0..2000 {
+            let mce = get_unique_mce();
+            mc1.content_mut().push(&mce);
+            expected_mces.push(mce);
+        }
+
+        let mc2 = MutationCache::shm_open("test", false).unwrap();
+        assert_mutation_cache_eq(&mc1, &mc2);
+    }
 }

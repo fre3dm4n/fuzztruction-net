@@ -3,10 +3,11 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/InstrTypes.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
 
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/GlobalValue.h"
@@ -17,17 +18,29 @@
 #include "llvm/IR/Intrinsics.h"
 
 #include "llvm/Transforms/Utils.h"
+#include <algorithm>
+#include <assert.h>
+#include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/Constant.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/PassInstrumentation.h>
 #include <llvm/IR/Use.h>
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Attributes.h>
 
+#include <llvm/Support/Casting.h>
 #include <llvm/Support/Debug.h>
 #include <llvm/Transforms/Utils/ValueMapper.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/IRReader/IRReader.h>
+
+#include <llvm/IR/GlobalValue.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -38,48 +51,36 @@
 
 #include "config.hpp"
 
-#include "fuzztruction-preprocessing-pass.hpp"
+//#include "fuzztruction-preprocessing-pass.hpp"
 
 using namespace llvm;
 
-/*
-We need the following capabilites:
-    - The ability to mutate the values loaded/stored by load and store instructions.
-    - Some way to trace which store/load instructions where executed in which order.
-        - via. INT3 tracing?
-        - via. patch point and custom stub that is called?
-        - ?We need some RT to transfer the traces to the parent
-*/
-
 namespace {
 
-    class FuzztructionSourcePass : public ModulePass {
+    class FuzztructionSourcePass : public PassInfoMixin<FuzztructionSourcePass> {
+    private:
+        std::set<Value *> instrumented_values;
 
     public:
-
-        static char ID;
         static bool allow_ptr_ty;
         static bool allow_vec_ty;
-        FuzztructionSourcePass() : ModulePass(ID) { }
 
-        enum InsTy {Random = 0, Load = 1, Store = 2, Add = 3, Sub = 4, Icmp = 5, Select = 6, Branch = 7, Switch = 8};
-        static std::string insTyNames[9];
+        enum InsTy {Random = 0, Load = 1, Store = 2, Add = 3, Sub = 4, Icmp = 5, Select = 6, Branch = 7, Switch = 8, Call = 9};
+        static std::string insTyNames[10];
 
         bool initializeFuzzingStub(Module &M);
         bool injectPatchPoints(Module &M);
         std::vector<Value *> getPatchpointArgs(Module &M, uint32_t id);
         bool instrumentInsArg(Module &M, Function *stackmap_intr, Instruction *ins, uint8_t op_idx);
+        bool instrumentCall(Module &M, Function *stackmap_intr, CallInst *ins);
         bool instrumentInsOutput(Module &M, Function *stackmap_intr, Instruction *ins);
         bool maybeDeleteFunctionCall(Module &M, CallInst *call_ins, std::set<std::string> &target_functions);
         bool filterInvalidPatchPoints(Module &M);
         bool replaceMemFunctions(Module &M);
+        bool instrumentFunctionEntry(Function &F, Function *stackmap_intr);
+        bool instrumentCustomPatchPoints(Module &M, Function *stackmap_intr);
 
-        bool runOnModule(Module &M) override;
-
-        StringRef getPassName() const override {
-            return "FuzzTruction Source Pass";
-        }
-
+        PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
     };
 
 
@@ -104,15 +105,19 @@ inline bool operator<(const InsHook& lhs, const InsHook& rhs)
 }
 
 
-bool FuzztructionSourcePass::runOnModule(Module &M) {
+PreservedAnalyses FuzztructionSourcePass::run(Module &M, ModuleAnalysisManager &MAM) {
 
     bool module_modified = false;
 
-    module_modified |= initializeFuzzingStub(M);
     module_modified |= injectPatchPoints(M);
     module_modified |= filterInvalidPatchPoints(M);
+    module_modified |= initializeFuzzingStub(M);
 
-    return module_modified;
+    if (module_modified) {
+        return PreservedAnalyses::none();
+    } else {
+        return PreservedAnalyses::all();
+    }
 }
 
 
@@ -174,7 +179,6 @@ uint32_t parse_env_var_int(const char* env_var, uint32_t default_val) {
 Convert set of strings to known instruction types. Ignores unknown elements.
 */
 FuzztructionSourcePass::InsTy to_InsTy(std::string input) {
-    // dbgs() << "val=" << val << "\n";
     if (input == "random")
         return FuzztructionSourcePass::InsTy::Random;
     if (input == "load")
@@ -193,6 +197,8 @@ FuzztructionSourcePass::InsTy to_InsTy(std::string input) {
         return FuzztructionSourcePass::InsTy::Branch;
     if (input == "switch")
         return FuzztructionSourcePass::InsTy::Switch;
+    if (input == "call")
+        return FuzztructionSourcePass::InsTy::Call;
 
     errs() << "Unsupported instruction string received: " << input << "\n";
     exit(1);
@@ -219,11 +225,55 @@ bool FuzztructionSourcePass::initializeFuzzingStub(Module &M) {
     our stub relies on keystone which has static constructors that are executed after functions
     marked by the constructor attribute. Hence, we can not use keystone at that point in time.
     */
-    auto hook_fn = M.getOrInsertFunction("__ft_auto_init", FunctionType::getVoidTy(M.getContext()));
+    auto init_hook_fn = M.getOrInsertFunction("__ft_auto_init", FunctionType::getVoidTy(M.getContext()));
+
     auto main_fn = M.getFunction("main");
     if (main_fn) {
         IRBuilder<> ins_builder(main_fn->getEntryBlock().getFirstNonPHI());
-        ins_builder.CreateCall(hook_fn);
+        ins_builder.CreateCall(init_hook_fn);
+    }
+
+    // Insert a call to __ft_after_listen after the 'listen' function returns.
+    auto listen_hook_fn = M.getOrInsertFunction("__ft_after_listen", FunctionType::getVoidTy(M.getContext()));
+    auto listen_fn = M.getFunction("listen");
+    if (listen_fn && listen_fn->arg_size() == 2) {
+        // check if arg types match those of the type of listen function we are interested in.
+        auto first_arg = listen_fn->getArg(0);
+        auto second_arg = listen_fn->getArg(1);
+        if (first_arg->getType()->isIntegerTy() && second_arg->getType()->isIntegerTy()) {
+            for (const auto& user : listen_fn->users()) {
+                if(CallInst* call_ins = dyn_cast<CallInst>(user)) {
+                    dbgs() << *call_ins << "\n";
+                    IRBuilder<> ins_builder(call_ins->getNextNode());
+                    ins_builder.CreateCall(listen_hook_fn);
+                }
+            }
+        }
+    }
+
+    // Insert a call to __ft_after_bind after the 'bind' function returns.
+    auto bind_hook_fn = M.getOrInsertFunction("__ft_after_bind", FunctionType::getVoidTy(M.getContext()));
+    auto bind_fn = M.getFunction("bind");
+    if (bind_fn && bind_fn->arg_size() == 3) {
+        for (const auto& user : bind_fn->users()) {
+            if(CallInst* call_ins = dyn_cast<CallInst>(user)) {
+                dbgs() << *call_ins << "\n";
+                IRBuilder<> ins_builder(call_ins->getNextNode());
+                ins_builder.CreateCall(bind_hook_fn);
+            }
+        }
+    }
+
+    auto connect_hook_fn = M.getOrInsertFunction("__ft_after_connect", FunctionType::getVoidTy(M.getContext()));
+    auto connect_fn = M.getFunction("connect");
+    if (connect_fn && connect_fn->arg_size() == 3) {
+        for (const auto& user : connect_fn->users()) {
+            if(CallInst* call_ins = dyn_cast<CallInst>(user)) {
+                dbgs() << "patching connect call: " << *call_ins << "\n";
+                IRBuilder<> ins_builder(call_ins->getNextNode());
+                ins_builder.CreateCall(connect_hook_fn);
+            }
+        }
     }
 
     return true;
@@ -293,11 +343,199 @@ std::vector<Value *> FuzztructionSourcePass::getPatchpointArgs(Module &M, uint32
 }
 
 
+uint64_t get_alloction_size_in_bits(AllocaInst *ins, Value *target) {
+    if (target->getType()->isIntegerTy()) {
+        return target->getType()->getIntegerBitWidth();
+    } else {
+        return *ins->getAllocationSizeInBits(ins->getModule()->getDataLayout());
+    }
+}
+
+
+bool FuzztructionSourcePass::instrumentCustomPatchPoints(Module &M, Function *stackmap_intr) {
+    auto custom_patch_points_enables = env_var_set("FT_CUSTOM_PATCH_POINTS");
+
+    std::vector<User*> users;
+    auto ft_get_byte_fn = M.getOrInsertFunction("__ft_get_byte", FunctionType::getInt8Ty(M.getContext()));
+    for (auto user : ft_get_byte_fn.getCallee()->users()) {
+        users.push_back(user);
+    }
+
+    for (auto user : users) {
+        if(CallInst* call_ins = dyn_cast<CallInst>(user)) {
+            dbgs() << "User: " << *call_ins << "\n";
+            if (custom_patch_points_enables) {
+                dbgs() << "Injecting cutstom patch point\n";
+                IRBuilder<> irb(&*call_ins);
+                auto slot_type = IntegerType::getInt8Ty(M.getContext());
+
+                auto *slot = irb.CreateAlloca(slot_type);
+                irb.CreateStore(ConstantInt::get(slot_type, 0), slot);
+                std::vector<Value *> patchpoint_args = getPatchpointArgs(M, 1338);
+                patchpoint_args.push_back(slot);
+                patchpoint_args.push_back(irb.getInt64(8));
+                irb.CreateCall(stackmap_intr, patchpoint_args);
+                auto mutated_ins = irb.CreateLoad(slot_type, slot);
+                call_ins->replaceAllUsesWith(mutated_ins);
+            } else {
+                call_ins->replaceAllUsesWith(ConstantInt::get(IntegerType::getInt8Ty(M.getContext()), 0));
+            }
+            call_ins->eraseFromParent();
+        }
+    }
+
+    return true;
+}
+
+
+bool FuzztructionSourcePass::instrumentFunctionEntry(Function &instrumented_function, Function *stackmap_intr) {
+    auto call_injection_enabled = env_var_set("FT_CALL_INJECTION");
+    if (!call_injection_enabled || instrumented_function.isVarArg()) {
+        return false;
+    }
+
+    if (instrumented_function.empty())
+        return false;
+
+    if (instrumented_function.getName().starts_with("__ft")) {
+        return false;
+    }
+
+    std::vector<Value *> instrumented_function_args;
+    for (auto &arg: instrumented_function.args()) {
+        instrumented_function_args.push_back(&arg);
+    }
+
+    std::vector<Constant *> potential_targets;
+    auto module = instrumented_function.getParent();
+    for (auto &f: module->functions()) {
+        bool skip = false;
+        if (&f == &instrumented_function) {
+            continue;
+        }
+
+        if (f.getName().starts_with("__ft")) {
+            continue;
+        }
+
+        if (f.arg_size() != instrumented_function.arg_size()) {
+            continue;
+        }
+
+        if (f.getReturnType() != instrumented_function.getReturnType()) {
+            continue;
+        }
+
+        if (f.isIntrinsic()) {
+            continue;
+        }
+
+        for (int i = 0; i < f.arg_size(); i++) {
+            if ( f.getArg(i)->getType() != instrumented_function.getArg(i)->getType()) {
+                skip = true;
+                break;
+            }
+        }
+        if (skip) {
+            continue;
+        }
+
+        potential_targets.push_back(&f);
+    }
+
+    if (potential_targets.empty()) {
+        return false;
+    }
+
+    dbgs() << "Found: " << potential_targets.size() << " potential targets\n";
+
+    // We can use 7 bits -> 128 values and need the 0 to encode the nop-action.
+    // 128 -1 = 127 possible call targets.
+    if (potential_targets.size() > 127) {
+        potential_targets.resize(127);
+    }
+
+    // total number of bits needed to make a decision
+    // +1 is the bit used to determine whether to skip execution of `instrumented_function`.
+    auto potential_target_encoding_bits_needed = (int) std::ceil(std::log2(potential_targets.size())) + 1;
+    assert(potential_target_encoding_bits_needed <= 8);
+
+    auto potential_target_encoding_select_fn_msk = (1 << (potential_target_encoding_bits_needed - 1)) - 1;
+    auto potential_target_encoding_skip_fn_msk = 1 << (potential_target_encoding_bits_needed - 1);
+
+    auto array_type = llvm::ArrayType::get(instrumented_function.getType(), potential_targets.size());
+    llvm::Constant* array = llvm::ConstantArray::get(array_type, potential_targets);
+
+    // Create a unique name for the global constant
+    std::string global_name = "call_injection_array_" + std::to_string(rand());
+
+    // Create the global variable
+    auto global_var = new llvm::GlobalVariable(*module, array_type, true, llvm::GlobalValue::PrivateLinkage, array, global_name);
+
+    // Get byte from patch point
+    std::vector<Value *> patchpoint_args = getPatchpointArgs(*module, 1337);
+
+    auto insertion_point = instrumented_function.getEntryBlock().getFirstInsertionPt();
+    IRBuilder<> irb(&*insertion_point);
+
+    auto &context = module->getContext();
+    auto slot_type = IntegerType::getInt8Ty(context);
+
+    auto *slot = irb.CreateAlloca(slot_type);
+    irb.CreateStore(ConstantInt::get(slot_type, 0), slot);
+
+    patchpoint_args.push_back(slot);
+    patchpoint_args.push_back(irb.getInt64(potential_target_encoding_bits_needed));
+    irb.CreateCall(stackmap_intr, patchpoint_args);
+
+    auto slot_value = irb.CreateLoad(slot_type, slot);
+    auto slot_value_is_not_zero = irb.CreateICmpNE(slot_value, ConstantInt::get(slot_type, 0));
+
+    auto *function_call_block = llvm::SplitBlockAndInsertIfThen(slot_value_is_not_zero, &*insertion_point, false);
+    irb.SetInsertPoint(function_call_block);
+
+    // mask out the high bit
+    auto selected_index_masked = irb.CreateAnd(slot_value, ConstantInt::get(slot_type, potential_target_encoding_select_fn_msk));
+    auto selected_index_unbound = irb.CreateSub(selected_index_masked, ConstantInt::get(slot_type, 1));
+    auto selected_index = irb.CreateURem(selected_index_unbound, ConstantInt::get(slot_type, potential_targets.size()));
+
+    auto target_fn_ptr_ptr = irb.CreateInBoundsGEP(instrumented_function.getType(), global_var, {selected_index});
+    auto target_fn_ptr = irb.CreateLoad(instrumented_function.getType(), target_fn_ptr_ptr);
+
+    // call the function that we injected
+    auto injected_fn_ret = irb.CreateCall(instrumented_function.getFunctionType(), target_fn_ptr, instrumented_function_args);
+
+    // get the highest bit of the byte retrived from the patch point.
+    auto high_bit_set = irb.CreateAnd(slot_value, ConstantInt::get(slot_type, potential_target_encoding_skip_fn_msk));
+    auto skip_instrumented_function = irb.CreateICmpNE(high_bit_set, ConstantInt::get(slot_type, 0));
+
+    // called if the current function should be skipped
+    auto *skip_function_block = llvm::SplitBlockAndInsertIfThen(skip_instrumented_function, &*function_call_block, true);
+    irb.SetInsertPoint(skip_function_block);
+
+    if (instrumented_function.getFunctionType()->getReturnType()->isVoidTy()) {
+        irb.CreateRetVoid();
+    } else {
+        irb.CreateRet(injected_fn_ret);
+    }
+
+    // the unreachable
+    skip_function_block->getParent()->getTerminator()->eraseFromParent();
+
+    return true;
+}
+
+
 /*
 Instrument the output value of the instruction. In other words, the value produced by the instruction
 is the live value fed into the patchpoint.
 */
 bool FuzztructionSourcePass::instrumentInsOutput(Module &M, Function *stackmap_intr, Instruction *ins) {
+    auto parent_fn = ins->getParent()->getParent();
+    auto insertion_point = parent_fn->getEntryBlock().getFirstInsertionPt();
+    IRBuilder<> irb(&*insertion_point);
+    auto *slot = irb.CreateAlloca(ins->getType());
+
     // dbgs() << "instrumentInsOutput called\n";
     Instruction *next_ins = ins;
     /* In case of a load the patchpoint is inserted after the load was executed */
@@ -306,17 +544,36 @@ bool FuzztructionSourcePass::instrumentInsOutput(Module &M, Function *stackmap_i
     if (!next_ins)
         return false;
 
-    IRBuilder<> ins_builder(next_ins);
+    if (this->instrumented_values.count(ins) > 0) {
+        return false;
+    } else {
+        this->instrumented_values.insert(ins);
+    }
 
-    /*
-        declare void
-        @llvm.experimental.patchpoint.void(i64 <id>, i32 <numBytes>,
-                                            i8* <target>, i32 <numArgs>, ...)
-    */
+    irb.SetInsertPoint(next_ins);
     std::vector<Value *> patchpoint_args = getPatchpointArgs(M, ins->getOpcode());
 
-    patchpoint_args.push_back(ins);
-    ins_builder.CreateCall(stackmap_intr, patchpoint_args);
+    std::vector<User *> users;
+    for (auto user: ins->users()) {
+        users.push_back(user);
+    }
+
+    // Store on stack
+    irb.CreateStore(ins, slot);
+
+    patchpoint_args.push_back(slot);
+    patchpoint_args.push_back(irb.getInt64(get_alloction_size_in_bits(slot, ins)));
+    irb.CreateCall(stackmap_intr, patchpoint_args);
+
+    auto mutated_ins = irb.CreateLoad(ins->getType(), slot);
+    for (auto user : users) {
+        // if (CallInst* call_ins = dyn_cast<CallInst>(user)){
+        //     if (call_ins->getFunction() == stackmap_intr) {
+        //         continue;
+        //     }
+        // }
+        user->replaceUsesOfWith(ins, mutated_ins);
+    }
 
     return true;
 }
@@ -328,25 +585,75 @@ This input value is the live value connected to the patchpoint, where it can be 
 processed by the instruction.
 */
 bool FuzztructionSourcePass::instrumentInsArg(Module &M, Function *stackmap_intr, Instruction *ins, uint8_t op_idx) {
-    // dbgs() << "instrumentInsArg called\n";
     if (!ins)
         return false;
 
-    IRBuilder<> ins_builder(ins);
+    auto op = ins->getOperand(op_idx);
 
-    /*
-        declare void
-        @llvm.experimental.patchpoint.void(i64 <id>, i32 <numBytes>,
-                                            i8* <target>, i32 <numArgs>, ...)
-    */
+    if (this->instrumented_values.count(op) > 0) {
+        return false;
+    } else {
+        this->instrumented_values.insert(op);
+    }
+
+    auto parent_fn = ins->getParent()->getParent();
+    auto insertion_point = parent_fn->getEntryBlock().getFirstInsertionPt();
+    IRBuilder<> irb(&*insertion_point);
+    auto *slot = irb.CreateAlloca(op->getType());
+
+    irb.SetInsertPoint(ins);
     std::vector<Value *> patchpoint_args = getPatchpointArgs(M, ins->getOpcode());
 
-    /* We want to modify argument at op_idx (e.g., 0 for stores) */
-    patchpoint_args.push_back(ins->getOperand(op_idx));
-    ins_builder.CreateCall(stackmap_intr, patchpoint_args);
+    irb.CreateStore(op, slot);
+
+    // record stack slot
+    patchpoint_args.push_back(slot);
+    patchpoint_args.push_back(irb.getInt64(get_alloction_size_in_bits(slot, op)));
+    irb.CreateCall(stackmap_intr, patchpoint_args);
+
+    // Load from stack
+    auto mutated_op = irb.CreateLoad(op->getType(), slot);
+
+    // Use the patched value instead of the original one.
+    ins->setOperand(op_idx, mutated_op);
 
     return true;
 }
+
+bool FuzztructionSourcePass::instrumentCall(Module &M, Function *stackmap_intr, CallInst *call) {
+    if (!call->user_empty())
+        return false;
+
+    if (this->instrumented_values.count(call) > 0) {
+        return false;
+    } else {
+        this->instrumented_values.insert(call);
+    }
+
+    auto parent_fn = call->getParent()->getParent();
+    auto insertion_point = parent_fn->getEntryBlock().getFirstInsertionPt();
+    IRBuilder<> irb(&*insertion_point);
+    auto *condition = irb.CreateAlloca(irb.getInt1Ty());
+
+    std::vector<Value *> patchpoint_args = getPatchpointArgs(M, call->getOpcode());
+    irb.SetInsertPoint(call);
+    // by default always take the call ins
+    irb.CreateStore(irb.getInt1(true), condition);
+
+    // record stack slot
+    patchpoint_args.push_back(condition);
+    patchpoint_args.push_back(irb.getInt64(1));
+    irb.CreateCall(stackmap_intr, patchpoint_args);
+
+    // Load from stack
+    auto mutated_condition = irb.CreateLoad(irb.getInt1Ty(), condition);
+
+    auto *new_block = llvm::SplitBlockAndInsertIfThen(mutated_condition, call, false);
+    call->moveBefore(new_block);
+
+    return true;
+}
+
 
 
 bool isValidTy(Type* ty) {
@@ -379,8 +686,13 @@ bool canBeInstrumented(Instruction *ins) {
         return false;
     // if (ins->isDebugOrPseudoInst())
     //     return false;
+#if LLVM_VERSION_MAJOR <= 17
     if (ins->isExceptionalTerminator())
         return false;
+#else
+    if (ins->isSpecialTerminator())
+        return false;
+#endif
     if (ins->isLifetimeStartOrEnd())
         return false;
     if (ins->isEHPad())
@@ -410,11 +722,69 @@ The value random is special in the sense that each instruction we can instrument
 We recommend to set a probability, at least for random (to avoid instrumenting too many instructions).
 */
 bool FuzztructionSourcePass::injectPatchPoints(Module &M) {
+    bool modified = false;
+    this->instrumented_values = {};
+
     /* Get the patchpoint intrinsic */
     Function* stackmap_intr = Intrinsic::getDeclaration(&M,
         Intrinsic::experimental_patchpoint_void
     );
     stackmap_intr->setCallingConv(CallingConv::AnyReg);
+
+    std::vector<CallInst*> abort_fn_callees;
+    auto abort_fn = M.getFunction("abort");
+    if (abort_fn && abort_fn->arg_size() == 0) {
+            for (auto user : abort_fn->users()) {
+                if(CallInst* call_ins = dyn_cast<CallInst>(user)) {
+                    abort_fn_callees.push_back(call_ins);
+                }
+            }
+    }
+
+    for (auto call_ins: abort_fn_callees) {
+        dbgs() << "Deleting call to abort " << *call_ins << "\n";
+        auto bb = call_ins->getParent();
+        auto bb_terminator = bb->getTerminator();
+        auto function = bb->getParent();
+
+        auto ret_type = function->getReturnType();
+        if (ret_type->isIntegerTy()) {
+            auto ret_val = ConstantInt::get(ret_type, 0);
+            IRBuilder<> irb(bb_terminator);
+            irb.CreateRet(ret_val);
+        } else if (ret_type->isVoidTy()) {
+            IRBuilder<> irb(bb_terminator);
+            irb.CreateRetVoid();
+        } else {
+            continue;
+        }
+
+        call_ins->eraseFromParent();
+        bb_terminator->eraseFromParent();
+    }
+
+    auto allowlisted_functions = parse_env_var_list("FT_FUNCTION_ALLOWLIST");
+    dbgs() << "allowlisted_functions: " << allowlisted_functions.size() << "\n";
+
+    auto allowlisted_files = parse_env_var_list("FT_FILE_ALLOWLIST");
+    dbgs() << "allowlisted_files: " << allowlisted_files.size() << "\n";
+
+    auto blocklisted_files = parse_env_var_list("FT_FILE_BLOCKLIST");
+    dbgs() << "blocklisted_files: " << blocklisted_files.size() << "\n";
+
+    if (allowlisted_files.size() > 0) {
+        if (std::find(allowlisted_files.begin(), allowlisted_files.end(), M.getSourceFileName()) != allowlisted_files.end()) {
+            dbgs() << "FT: File is listed as allowed " << M.getSourceFileName() << "\n";
+        } else {
+            dbgs() << "FT: File is not on the allow list " << M.getSourceFileName() << "\n";
+            return modified;
+        }
+    } else {
+        if (std::find(blocklisted_files.begin(), blocklisted_files.end(), M.getSourceFileName()) != blocklisted_files.end()) {
+            dbgs() << "FT: Skipping blockedlisted file " << M.getSourceFileName() << "\n";
+            return modified;
+        }
+    }
 
     auto allowlisted_files = parse_env_var_list("FT_FILE_ALLOWLIST");
     dbgs() << "allowlisted_files: " << allowlisted_files.size() << "\n";
@@ -460,17 +830,37 @@ bool FuzztructionSourcePass::injectPatchPoints(Module &M) {
     std::mt19937 gen(rd());
     std::uniform_int_distribution<> distr(0, 100); // inclusive [0, 100]
 
+    modified |= instrumentCustomPatchPoints(M, stackmap_intr);
+
     // Track whether we modified the module
-    bool modified = false;
     uint64_t num_patchpoints = 0;
     for (auto &F : M) {
+        if (allowlisted_functions.size() > 0) {
+            if (std::find(allowlisted_functions.begin(), allowlisted_functions.end(), F.getName()) != allowlisted_functions.end()) {
+                dbgs() << "FT: function is on the allowlist " << F.getName() << "\n";
+            } else {
+                dbgs() << "FT: function is not on the allowlist " << F.getName() << "\n";
+                continue;
+            }
+        } else {
+            if (std::find(blocklisted_functions.begin(), blocklisted_functions.end(), F.getName()) != blocklisted_functions.end()) {
+                dbgs() << "FT: Skipping blockedlisted function " << F.getName() << "\n";
+                continue;
+            }
+        }
+        std::vector<Instruction*> instructions;
         for (auto &B : F) {
             for (BasicBlock::iterator DI = B.begin(); DI != B.end(); ) {
-                // ensure that iterator points to next instruction
-                // in case we need to delete the instruction
                 Instruction& I = *DI++;
+                instructions.push_back(&I);
+            }
+        }
 
-                if (auto *call_ins = dyn_cast<CallInst>(&I)) {
+        // function call mutation
+        modified |= instrumentFunctionEntry(F, stackmap_intr);
+
+        for (auto *I: instructions) {
+                if (auto *call_ins = dyn_cast<CallInst>(I)) {
                     bool deleted = maybeDeleteFunctionCall(M, call_ins, fn_del);
                     modified |= deleted;
                     // No point to continue if we just deleted the instruction
@@ -483,73 +873,84 @@ bool FuzztructionSourcePass::injectPatchPoints(Module &M) {
                     bool ins_modified = false;
                     switch (ins_hook.type) {
                         case FuzztructionSourcePass::InsTy::Load:
-                            if (auto *load_op = dyn_cast<LoadInst>(&I)) {
+                            if (auto *load_op = dyn_cast<LoadInst>(I)) {
                                 if (distr(gen) <= ins_hook.probability)
-                                    ins_modified = instrumentInsOutput(M, stackmap_intr, &I);
+                                    ins_modified = instrumentInsOutput(M, stackmap_intr, I);
                             }
                             break;
                         case FuzztructionSourcePass::InsTy::Store:
-                            if (auto *store_op = dyn_cast<StoreInst>(&I)) {
+                            if (auto *store_op = dyn_cast<StoreInst>(I)) {
                                 if (distr(gen) <= ins_hook.probability)
-                                    ins_modified = instrumentInsArg(M, stackmap_intr, &I, /* op_idx = */ 0);
+                                    ins_modified = instrumentInsArg(M, stackmap_intr, I, 0);
                             }
                             break;
                         case FuzztructionSourcePass::InsTy::Add:
-                            if (I.getOpcode() == Instruction::Add) {
+                            if (I->getOpcode() == Instruction::Add) {
                                 if (distr(gen) <= ins_hook.probability)
-                                    ins_modified = instrumentInsArg(M, stackmap_intr, &I, /* op_idx = */ 0);
+                                    ins_modified = instrumentInsArg(M, stackmap_intr, I, 0);
                             }
                             break;
                         case FuzztructionSourcePass::InsTy::Sub:
-                            if (I.getOpcode() == Instruction::Sub) {
+                            if (I->getOpcode() == Instruction::Sub) {
                                 if (distr(gen) <= ins_hook.probability)
-                                    ins_modified = instrumentInsArg(M, stackmap_intr, &I, /* op_idx = */ 1);
+                                    ins_modified = instrumentInsArg(M, stackmap_intr, I, 1);
                             }
                             break;
                         case FuzztructionSourcePass::InsTy::Icmp:
-                            if (I.getOpcode() == Instruction::ICmp) {
+                            if (I->getOpcode() == Instruction::ICmp) {
                                 if (distr(gen) <= ins_hook.probability)
-                                    ins_modified = instrumentInsOutput(M, stackmap_intr, &I);
+                                    ins_modified = instrumentInsOutput(M, stackmap_intr, I);
                             }
                             break;
                         case FuzztructionSourcePass::InsTy::Select:
-                            if (I.getOpcode() == Instruction::Select) {
+                            if (I->getOpcode() == Instruction::Select) {
                                 if (distr(gen) <= ins_hook.probability)
-                                    // Arg 0 is the selection mask
-                                    ins_modified = instrumentInsArg(M, stackmap_intr, &I, /* op_idx = */ 0);
+                                    // Arg 0 is the selection mask (i1 or {<N x i1>})
+                                    ins_modified = instrumentInsArg(M, stackmap_intr, I, 0);
                             }
                             break;
                         case FuzztructionSourcePass::InsTy::Branch:
-                            // FIXME: Fails to compile.
-                            // if (I.getOpcode() == Instruction::Br && distr(gen) <= ins_hook.probability) {
-                            //     // Arg 0 is the branch condition (i1)
-                            //     ins_modified = instrumentInsArg(M, stackmap_intr, &I, /* op_idx = */ 0);
-                            // }
+                            if (I->getOpcode() == Instruction::Br && distr(gen) <= ins_hook.probability) {
+                                // Conditional jump receives multiple args.
+                                if (I->getNumOperands() > 1) {
+                                    // Arg 0 is the branch condition (i1)
+                                    ins_modified = instrumentInsArg(M, stackmap_intr, I, 0);
+                                }
+                            }
                             break;
                         case FuzztructionSourcePass::InsTy::Switch:
-                            if (I.getOpcode() == Instruction::Switch && distr(gen) <= ins_hook.probability) {
-                                // Arg 0 is the switch condition (i1)
-                                ins_modified = instrumentInsArg(M, stackmap_intr, &I, /* op_idx = */ 0);
+                            if (I->getOpcode() == Instruction::Switch && distr(gen) <= ins_hook.probability) {
+                                // Arg 0 is the switch condition (intty)
+                                ins_modified = instrumentInsArg(M, stackmap_intr, I, 0);
                             }
                             break;
                         case FuzztructionSourcePass::InsTy::Random:
-                            if (!canBeInstrumented(&I))
+                            if (!canBeInstrumented(I))
                                 break;
                             if (distr(gen) <= ins_hook.probability) {
-                                ins_modified = instrumentInsOutput(M, stackmap_intr, &I);
+                                ins_modified = instrumentInsOutput(M, stackmap_intr, I);
                             }
+                            break;
+                        case FuzztructionSourcePass::InsTy::Call:
+                            auto *call = dyn_cast<CallInst>(I);
+                            if (call && distr(gen) <= ins_hook.probability) {
+                                ins_modified = instrumentCall(M, stackmap_intr, call);
+                            }
+                            break;
                     }
                     if (ins_modified) {
                         modified = true;
                         num_patchpoints++;
+                        // dbgs() << "Instrumented function " << I->getFunction()->getName() << "\n";
+                        // dbgs() << "Linkage " << I->getFunction()->getLinkage() << "\n";
+                        // dbgs() << "Visibility " << I->getFunction()->getVisibility() << "\n";
                         // instruction cannot have multiple types
                         // no point in trying other types if we just matched
                         break;
                     }
                 }
-            }
         }
-        //llvm::errs() << "dump-start\n";
+        //llvm::errs() << "function-dump-start\n";
         //F.dump();
     }
     dbgs() << "FT: Inserted " << num_patchpoints << " patchpoints\n";
@@ -557,8 +958,29 @@ bool FuzztructionSourcePass::injectPatchPoints(Module &M) {
     return modified;
 }
 
+void removeArgumentFromCallInst(CallInst *callInst, unsigned argIndexToRemove) {
+    // Get the original arguments of the CallInst
+    std::vector<Value*> originalArgs(callInst->arg_begin(), callInst->arg_end());
+
+    // Remove the desired argument
+    originalArgs.erase(originalArgs.begin() + argIndexToRemove);
+
+    // Create a new CallInst with the modified arguments
+    CallInst* newCallInst = CallInst::Create(callInst->getFunctionType(),
+                                             callInst->getCalledOperand(),
+                                             originalArgs,
+                                             "",
+                                             callInst);
+
+    // Replace all uses of the original CallInst with the new CallInst
+    callInst->replaceAllUsesWith(newCallInst);
+
+    // Remove the original CallInst
+    callInst->eraseFromParent();
+}
+
 /*
-Filter & delete patchpoints if the live value is already used
+Filter & delete patchpoints if the live value is already recorded
 by another patchpoint.
 */
 bool FuzztructionSourcePass::filterInvalidPatchPoints(Module &M) {
@@ -572,27 +994,6 @@ bool FuzztructionSourcePass::filterInvalidPatchPoints(Module &M) {
     dbgs() << "FT: Filtering invalid patch points\n";
     std::set<Value *> used_values = {};
     std::set<Instruction *> pending_deletions = {};
-    for (const auto& user : stackmap_intr->users()) {
-        num_users++;
-        if(CallInst* call_ins = dyn_cast<CallInst>(user)) {
-            //errs() << "is sen: " << call_ins->isKnownSentinel() << "\n";
-            for (unsigned i = 4; i < call_ins->getNumArgOperands(); ++i) {
-                //errs() << "call ins\n";
-                //dbgs() << "call ins on dbg\n";
-                //call_ins->dump();
-                //errs().flush();
-                Value *val = call_ins->getArgOperand(i);
-                //errs() << "val\n";
-                //val->dump();
-                if (used_values.count(val) > 0) {
-                    pending_deletions.insert(call_ins);
-                    break;
-                } else {
-                    used_values.insert(val);
-                }
-            }
-        }
-    }
     for (auto &ins : pending_deletions) {
         //assert(ins->isSafeToRemove() && "Instruction is not safe to remove!");
         assert((ins->users().end() == ins->users().begin()) && "Cannot delete call instruction as it has uses");
@@ -604,23 +1005,25 @@ bool FuzztructionSourcePass::filterInvalidPatchPoints(Module &M) {
     return modified;
 }
 
-
-char FuzztructionSourcePass::ID = 0;
 bool FuzztructionSourcePass::allow_ptr_ty = false;
 bool FuzztructionSourcePass::allow_vec_ty = false;
-std::string FuzztructionSourcePass::insTyNames[] = {"random", "load", "store", "add", "sub", "icmp", "select", "br", "switch"};
+std::string FuzztructionSourcePass::insTyNames[] = {"random", "load", "store", "add", "sub", "icmp", "select", "branch", "switch", "call"};
 
-static void registerSourcePass(const PassManagerBuilder &,
-                            legacy::PassManagerBase &PM) {
-    if (!env_var_set("FT_DISABLE_INLINEING")) {
-        PM.add(new FuzztructionSourcePreprocesssingPass());
-        PM.add(llvm::createAlwaysInlinerLegacyPass());
-    }
-    PM.add(new FuzztructionSourcePass());
+extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
+llvmGetPassPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "ft-generator-pass", "v0.1",
+          [](PassBuilder &PB) {
+#if LLVM_VERSION_MAJOR == 13
+            using OptimizationLevel = typename PassBuilder::OptimizationLevel;
+#endif
+#if LLVM_VERSION_MAJOR >= 16
+            PB.registerOptimizerLastEPCallback(
+#else
+            PB.registerOptimizerLastEPCallback(
+#endif
+                [](ModulePassManager &MPM, OptimizationLevel OL) {
+                  MPM.addPass(FuzztructionSourcePass());
+                });
+          }};
+
 }
-
-static RegisterStandardPasses RegisterSourcePass(
-    PassManagerBuilder::EP_OptimizerLast, registerSourcePass);
-
-static RegisterStandardPasses RegisterSourcePass0(
-    PassManagerBuilder::EP_EnabledOnOptLevel0, registerSourcePass);

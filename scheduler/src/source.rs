@@ -5,11 +5,15 @@ use fuzztruction_shared::{
     aux_messages::{AuxStreamMessage, AuxStreamType},
     aux_stream::AuxStreamAssembler,
     constants::{ENV_LOG_LEVEL, ENV_SHM_NAME, PATCH_POINT_SIZE},
+    dwarf::DwarfReg,
     log_utils::LogRecordWrapper,
-    messages::{ChildPid, HelloMessage},
+    messages::{
+        ChildPid, HelloMessage, Message, MessageType, MsgHeader, ReceivableMessages, RunMessage,
+        SyncMutations, TerminatedMessage, TracePointStat,
+    },
     mutation_cache::{MutationCacheEntryFlags, MutationCacheError},
-    types::PatchPointID,
-    util::current_log_level,
+    types::MutationSiteID,
+    util::{current_log_level, wait_pid_timeout},
 };
 use jail::jail::{Jail, JailBuilder};
 use llvm_stackmap::LocationType;
@@ -26,7 +30,7 @@ use mktemp::Temp;
 use nix::sys::signal::Signal;
 use posixmq::PosixMq;
 use proc_maps::{get_process_maps, MapRange};
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use rand::{distributions::Alphanumeric, seq::SliceRandom, thread_rng, Rng};
 use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{anyhow, Context, Result};
@@ -46,16 +50,14 @@ use log::{error, kv::ToValue};
 use lazy_static::lazy_static;
 use libc::{self};
 
-use crate::{config::Config, patchpoint};
-use crate::{constants::MAX_PATCHPOINT_CNT, llvm_stackmap::StackMap};
 use crate::{
-    messages::{
-        Message, MessageType, MsgHeader, ReceivableMessages, RunMessage, SyncMutations,
-        TerminatedMessage, TracePointStat,
-    },
-    trace::Trace,
+    config::Config,
+    mutation_site,
+    networked::{NetworkedRunResult, WaitForPeerResult},
 };
-use crate::{mutation_cache::MutationCache, patchpoint::PatchPoint};
+use crate::{constants::MAX_PATCHPOINT_CNT, llvm_stackmap::StackMap};
+use crate::{mutation_cache::MutationCache, mutation_site::MutationSite};
+use crate::{networked::ServerReadySignalKind, trace::Trace};
 
 use crate::io_channels::*;
 
@@ -68,7 +70,7 @@ const MAX_OUTPUT_SIZE: u64 = n_mib_bytes!(1) as u64;
 lazy_static! {
     /// Mapping of (binary path, Child PID) to patch point collection if they
     /// have already been parsed once.
-    static ref PATCH_POINT_CACHE: RwLock<HashMap<PathBuf, Arc<Vec<PatchPoint>>>> = RwLock::new(HashMap::new());
+    static ref PATCH_POINT_CACHE: RwLock<HashMap<PathBuf, Arc<Vec<MutationSite>>>> = RwLock::new(HashMap::new());
 }
 
 /// Type used to represent error conditions of the source.
@@ -117,6 +119,30 @@ pub enum RunResult {
     },
 }
 
+impl From<RunResult> for WaitForPeerResult {
+    fn from(val: RunResult) -> Self {
+        match val {
+            RunResult::Terminated { exit_code, msgs: _ } => {
+                WaitForPeerResult::Terminated(exit_code)
+            }
+            RunResult::Signalled { signal, msgs: _ } => WaitForPeerResult::Signalled(signal),
+            RunResult::TimedOut { msgs: _ } => WaitForPeerResult::TimedOut,
+        }
+    }
+}
+
+impl From<RunResult> for NetworkedRunResult {
+    fn from(val: RunResult) -> Self {
+        match val {
+            RunResult::Terminated { exit_code, msgs: _ } => {
+                NetworkedRunResult::Terminated(exit_code)
+            }
+            RunResult::Signalled { signal, msgs: _ } => NetworkedRunResult::Signalled(signal),
+            RunResult::TimedOut { msgs: _ } => NetworkedRunResult::TimedOut,
+        }
+    }
+}
+
 impl Debug for RunResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -138,13 +164,13 @@ struct Pid(i32);
 
 impl From<nix::unistd::Pid> for Pid {
     fn from(pid: nix::unistd::Pid) -> Self {
-        Pid(pid.as_raw() as i32)
+        Pid(pid.as_raw())
     }
 }
 
 impl From<proc_maps::Pid> for Pid {
     fn from(pid: proc_maps::Pid) -> Self {
-        Pid(pid as i32)
+        Pid(pid)
     }
 }
 
@@ -156,7 +182,7 @@ impl From<Pid> for nix::unistd::Pid {
 
 impl From<Pid> for i32 {
     fn from(pid: Pid) -> Self {
-        pid.0 as i32
+        pid.0
     }
 }
 
@@ -169,6 +195,7 @@ pub struct Source {
     args: Vec<String>,
     /// Workdir
     workdir: PathBuf,
+    workdir_root: String,
     /// Directory containing data related to the sources state.
     state_dir: PathBuf,
     /// The way input is consumed.
@@ -193,7 +220,6 @@ pub struct Source {
     mq_recv: Option<PosixMq>,
     /// The PID of the target's parent (source agent).
     pid: Option<i32>,
-    mem_file: Option<File>,
     log_stdout: bool,
     log_stderr: bool,
     mutation_cache: Rc<RefCell<MutationCache>>,
@@ -205,6 +231,11 @@ pub struct Source {
     jail: Option<Jail>,
     /// List of file that are not purged during workdir purging.
     workdir_file_whitelist: Vec<PathBuf>,
+    child_pid: Option<ChildPid>,
+    msg_buffer: Option<Vec<ReceivableMessages>>,
+    purge_ctr: usize,
+    bind_ctr: usize,
+    listen_ctr: usize,
 }
 
 impl Source {
@@ -221,6 +252,7 @@ impl Source {
         config: Option<&Config>,
     ) -> Result<Source> {
         let mut workdir_file_whitelist = Vec::new();
+        let workdir_root = workdir.clone();
 
         workdir.push("source");
 
@@ -235,6 +267,8 @@ impl Source {
         fs::create_dir_all(&state_dir)?;
 
         Source::check_link_time_deps(&path, config)?;
+
+        Source::check_if_linked_against_asan(&path, config)?;
 
         let mut rand_suffix: String = thread_rng()
             .sample_iter(&Alphanumeric)
@@ -290,22 +324,22 @@ impl Source {
         let input_file = (file_in, file_in_name);
         let mut output_file = (file_out, out_file_path);
 
-        let stdout_file = None;
-        // if log_stdout {
-        //     // Setup file for stdout logging.
-        //     let mut path = workdir.clone();
-        //     path.push("stdout");
-        //     workdir_file_whitelist.push(path.clone());
+        let mut stdout_file = None;
+        if log_stdout {
+            // Setup file for stdout logging.
+            let mut path = workdir.clone();
+            path.push("stdout");
+            workdir_file_whitelist.push(path.clone());
 
-        //     let file = OpenOptions::new()
-        //         .read(true)
-        //         .write(true)
-        //         .create(true)
-        //         .truncate(true)
-        //         .open(&path)
-        //         .unwrap();
-        //     stdout_file = Some((file, path));
-        // }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            stdout_file = Some((file, path));
+        }
 
         let mut stderr_file = None;
         if log_stderr {
@@ -447,6 +481,7 @@ impl Source {
             path,
             args,
             workdir,
+            workdir_root: workdir_root.to_str().unwrap().to_owned(),
             state_dir,
             input_channel,
             output_channel,
@@ -459,7 +494,6 @@ impl Source {
             mq_send: None,
             mq_recv: None,
             pid: None,
-            mem_file: None,
             log_stdout,
             log_stderr,
             mutation_cache: Rc::new(RefCell::new(mutation_cache)),
@@ -468,6 +502,11 @@ impl Source {
             config: config.cloned(),
             jail,
             workdir_file_whitelist,
+            child_pid: None,
+            msg_buffer: None,
+            purge_ctr: 0,
+            bind_ctr: 0,
+            listen_ctr: 0,
         })
     }
 
@@ -496,16 +535,22 @@ impl Source {
             ))
             .context(output)?;
         }
+
         Ok(())
     }
 
-    pub fn from_config(config: &Config, id: Option<usize>) -> Result<Source> {
+    pub fn from_config(config: &Config, id: Option<usize>, suffix: Option<&str>) -> Result<Source> {
         let config_new = config.clone();
         let mut workdir = config_new.general.work_dir.clone();
-        workdir.push(
-            id.map(|id| id.to_string())
-                .unwrap_or_else(|| "0".to_owned()),
-        );
+        let mut suffix_builder = id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "0".to_owned());
+
+        if let Some(suffix) = suffix {
+            suffix_builder.push('-');
+            suffix_builder.push_str(suffix);
+        }
+        workdir.push(suffix_builder);
 
         Source::new(
             config_new.source.bin_path,
@@ -527,6 +572,7 @@ impl Source {
         log::debug!("Creating sending MQ: {}", self.mq_send_name);
         self.mq_send = Some(
             posixmq::OpenOptions::readwrite()
+                .mode(0o777)
                 .create_new()
                 .open(&self.mq_send_name)
                 .context("Failed to create send MQ")?,
@@ -535,6 +581,7 @@ impl Source {
         log::debug!("Creating receiving MQ: {}", self.mq_recv_name);
         self.mq_recv = Some(
             posixmq::OpenOptions::readwrite()
+                .mode(0o777)
                 .create_new()
                 .open(&self.mq_recv_name)
                 .context("Failed to create recv MQ")?,
@@ -659,17 +706,17 @@ impl Source {
                             if !self.log_stdout {
                                 libc::dup2(dev_null_fd, libc::STDOUT_FILENO);
                             } else {
-                                // let fd = self.stdout_file.as_ref().unwrap().0.as_raw_fd();
-                                // libc::dup2(fd, libc::STDOUT_FILENO);
-                                // libc::close(fd);
+                                let fd = self.stdout_file.as_ref().unwrap().0.as_raw_fd();
+                                libc::dup2(fd, libc::STDOUT_FILENO);
+                                libc::close(fd);
                             }
                         }
                     }
 
                     if self.log_stderr {
-                        // let fd = self.stderr_file.as_ref().unwrap().0.as_raw_fd();
-                        // libc::dup2(fd, libc::STDERR_FILENO);
-                        // libc::close(fd);
+                        let fd = self.stderr_file.as_ref().unwrap().0.as_raw_fd();
+                        libc::dup2(fd, libc::STDERR_FILENO);
+                        libc::close(fd);
                     } else {
                         libc::dup2(dev_null_fd, libc::STDERR_FILENO);
                     }
@@ -691,13 +738,6 @@ impl Source {
                         assert_eq!(ret, 0);
                     }
 
-                    // Limit maximum virtual memory size.
-                    let mut rlim: libc::rlimit = std::mem::zeroed();
-                    rlim.rlim_cur = n_gib_bytes!(8).try_into().unwrap();
-                    rlim.rlim_max = n_gib_bytes!(8).try_into().unwrap();
-                    let ret = libc::setrlimit(libc::RLIMIT_AS, &rlim as *const libc::rlimit);
-                    assert_eq!(ret, 0);
-
                     // Disable core dumps
                     let limit_val: libc::rlimit = std::mem::zeroed();
                     let ret = libc::setrlimit(libc::RLIMIT_CORE, &limit_val);
@@ -707,11 +747,17 @@ impl Source {
                     let ret = libc::personality(libc::ADDR_NO_RANDOMIZE as u64);
                     assert_eq!(ret, 0);
 
-                    std::env::set_current_dir(&self.workdir).unwrap();
                     if let Some(ref mut jail) = self.jail {
                         // ! Make sure that the code in `enter()` is async-signal-safe since we
                         // ! are the forked child of a multithreaded application.
                         jail.enter().unwrap();
+                    }
+
+                    if let Some(ref working_dir) = self.config.as_ref().unwrap().source.working_dir
+                    {
+                        std::env::set_current_dir(working_dir).unwrap();
+                    } else {
+                        std::env::set_current_dir(&self.workdir).unwrap();
                     }
 
                     // Path of the source binary.
@@ -744,19 +790,8 @@ impl Source {
         log::debug!("Waiting for handshake message.");
         let msg = self
             .wait_for_message::<HelloMessage>(HANDSHAKE_TIMEOUT)
-            .context("Handshake error. Did the target fail to find libgenerator_agent.so or any other library it depends on? Please check the logs in the work directory. Pass --show-output (not to the subcommand) to print the targets output..")?;
+            .context("Handshake error. Did the target fail to find libgenerator_agent.so or any other library it depends on? Please check the logs in the work directory. Pass --log-output (not to the subcommand) to print the targets output..")?;
         log::debug!("Got HelloMessage. Agents TID is {:?}", msg.senders_tid);
-
-        // Get the `mem` file of the child thus we can modify the targets addressspace.
-        // This must happen after the child dropped the root permissions (if jailing is enabled).
-        // This is guranteed after we received the `HelloMessage`, thus do not move this up.
-        self.mem_file = Some(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(format!("/proc/{}/mem", child_pid))
-                .context("Failed to open /proc/<x>/mem")?,
-        );
 
         // Get the mapping of the target memory space.
         // NOTE: This might not include lazily loaded libraries.
@@ -787,10 +822,10 @@ impl Source {
     }
 
     #[allow(unused)]
-    fn remove_duplicated_vmas(patch_points: &mut Vec<PatchPoint>) {
+    fn remove_duplicated_vmas(patch_points: &mut Vec<MutationSite>) {
         let old_size = patch_points.len();
 
-        let mut vma_to_patch_points = HashMap::<u64, Vec<PatchPoint>>::new();
+        let mut vma_to_patch_points = HashMap::<u64, Vec<MutationSite>>::new();
         for pp in patch_points.iter() {
             let entry = vma_to_patch_points.entry(pp.vma()).or_default();
             entry.push(pp.clone());
@@ -802,8 +837,10 @@ impl Source {
 
         for (vma, mut duplicated_patchpoints) in vma_to_patch_points.into_iter() {
             log::warn!("Duplicated vma 0x{:x}! Enable trace for more details.", vma,);
-            duplicated_patchpoints
-                .sort_by(|e, other| e.location().loc_size.cmp(&other.location().loc_size));
+            duplicated_patchpoints.sort_by(|e, other| {
+                e.target_value_size_byte()
+                    .cmp(&other.target_value_size_byte())
+            });
 
             for p in duplicated_patchpoints.iter() {
                 log::trace!("{:#?}", p);
@@ -813,7 +850,8 @@ impl Source {
             // "super" location of the other(s) we are removing.
             for p in duplicated_patchpoints.iter().rev().skip(1) {
                 patch_points.retain(|other| {
-                    other.id() != p.id() || other.location().loc_size != p.location().loc_size
+                    other.id() != p.id()
+                        || other.target_value_size_byte() != p.target_value_size_byte()
                 });
             }
         }
@@ -825,16 +863,31 @@ impl Source {
     }
 
     /// Remove all patch points that recorded a const live value.
-    fn remove_const_types(patch_points: &mut Vec<PatchPoint>) {
-        patch_points.retain(|e| {
-            e.location().loc_type != LocationType::Constant
-                && e.location().loc_type != LocationType::ConstIndex
-        });
-    }
+    // fn remove_const_types(patch_points: &mut Vec<MutationSite>) {
+    //     patch_points.retain(|e| {
+    //         e.location().loc_type != LocationType::Constant
+    //             && e.location().loc_type != LocationType::ConstIndex
+    //     });
+    // }
 
     /// Remove all patch points that recorded a frame index
-    fn remove_direct_types(patch_points: &mut Vec<PatchPoint>) {
-        patch_points.retain(|e| e.location().loc_type != LocationType::Direct);
+    #[allow(unused)]
+    fn remove_direct_types(patch_points: &mut Vec<MutationSite>) {
+        patch_points.retain(|e| e.spill_slot().loc_type != LocationType::Direct);
+    }
+
+    #[allow(unused)]
+    fn remove_indirect_types(patch_points: &mut Vec<MutationSite>) {
+        patch_points.retain(|e| e.spill_slot().loc_type != LocationType::Indirect);
+    }
+
+    fn remove_unsupported_loc_size(patch_points: &mut Vec<MutationSite>) {
+        log::info!("Removing target values with loc_size > 8");
+        patch_points.retain(|e| e.target_value_size_byte() <= 8);
+    }
+
+    fn remove_rsp_spill_slots(patch_points: &mut Vec<MutationSite>) {
+        patch_points.retain(|e| e.spill_slot().dwarf_regnum != DwarfReg::Rsp as u16);
     }
 
     /// Resolve a path retrived from the child into a local path.
@@ -850,17 +903,19 @@ impl Source {
 
     /// Get all patchpoints of the main executable and all libraries mapped
     /// into the executables process memory.
-    pub fn get_patchpoints(&self) -> Result<Arc<Vec<PatchPoint>>> {
+    pub fn get_patchpoints(&self) -> Result<Arc<Vec<MutationSite>>> {
         let cache = PATCH_POINT_CACHE.read().unwrap();
 
         if let Some(value) = self.read_from_cache(&cache) {
             return Ok(value);
         }
 
+        // Cache was empty
+
         drop(cache);
         // Get write access
         let mut cache = PATCH_POINT_CACHE.write().unwrap();
-        // Recheck
+        // Recheck (maybe someone else filled the cache in the meantime)
         if let Some(value) = self.read_from_cache(&cache) {
             return Ok(value);
         }
@@ -876,17 +931,57 @@ impl Source {
 
         let mut patch_points = parse_file_backed_mappings(mappings);
 
+        //patch_points.retain(|e| e.llvm_ins() == LLVMInstruction::Switch);
+
+        self.retain_whitelisted(&mut patch_points);
+        self.limit_max_number(&mut patch_points);
+        self.remove_blocklisted_instructions(&mut patch_points);
+
+        let mut patchpoint_type_frequency = HashMap::new();
+        for pp in patch_points.iter() {
+            patchpoint_type_frequency
+                .entry(pp.spill_slot().loc_type)
+                .and_modify(|v| *v += 1)
+                .or_insert(1);
+        }
+        log::info!(
+            "patchpoint_type_frequency: {:#?}",
+            patchpoint_type_frequency
+        );
+
+        let mut target_value_size_freq = HashMap::new();
+        for pp in patch_points.iter() {
+            target_value_size_freq
+                .entry(pp.target_value_size_bit())
+                .and_modify(|v| *v += 1)
+                .or_insert(1);
+        }
+        log::info!(
+            "target_value_size_freq in bits: {:#?}",
+            target_value_size_freq
+        );
+
+        let mut patchpoint_instr_frequency = HashMap::new();
+        for pp in patch_points.iter() {
+            patchpoint_instr_frequency
+                .entry(pp.llvm_ins())
+                .and_modify(|v| *v += 1)
+                .or_insert(1);
+        }
+        log::info!(
+            "patchpoint_instr_frequency: {:#?}",
+            patchpoint_instr_frequency
+        );
+
         let pp_before_filtering = patch_points.len();
-        Source::remove_const_types(&mut patch_points);
-        Source::remove_direct_types(&mut patch_points);
+        //Source::remove_const_types(&mut patch_points);
+        //Source::remove_direct_types(&mut patch_points);
+        //Source::remove_indirect_types(&mut patch_points);
         Source::remove_duplicated_vmas(&mut patch_points);
+        Source::remove_unsupported_loc_size(&mut patch_points);
+        Source::remove_rsp_spill_slots(&mut patch_points);
 
-        self.remove_misaligned(&mut patch_points);
-
-        //Source::remove_overlapps(&mut patch_points);
-        // patch_points.retain(|e| e.location().dwarf_regnum != DwarfReg::Rbx as u16);
-        // patch_points.retain(|e| e.location().dwarf_regnum != DwarfReg::R13 as u16);
-        // patch_points.retain(|e| e.location().dwarf_regnum != DwarfReg::Rax as u16);
+        self.check_alignment(&mut patch_points);
 
         if pp_before_filtering > patch_points.len() {
             log::warn!(
@@ -894,10 +989,11 @@ impl Source {
                 pp_before_filtering - patch_points.len(),
                 (1.0 - patch_points.len() as f64 / pp_before_filtering as f64) * 100.0
             );
+        } else {
+            log::info!("We did not lose any patchpoints :)")
         }
 
         sanity_check_patch_points(&patch_points);
-
         log::debug!("Found {} patch points in total", patch_points.len());
         //self.dump_patchpoints(&patch_points);
         let patch_points = Arc::new(patch_points);
@@ -910,47 +1006,82 @@ impl Source {
         Ok(patch_points)
     }
 
+    fn limit_max_number(&self, patch_points: &mut Vec<MutationSite>) {
+        if let Some(mut max_patch_points) = self.config.as_ref().unwrap().source.max_patch_points {
+            log::info!("Number of patch points was limited to {}", max_patch_points);
+            patch_points.shuffle(&mut thread_rng());
+            patch_points.retain(|_| {
+                let is_positive = max_patch_points.is_positive();
+                max_patch_points -= 1;
+                is_positive
+            });
+        }
+    }
+
+    fn remove_blocklisted_instructions(&self, patch_points: &mut Vec<MutationSite>) {
+        if let Some(ref blocklist) = self
+            .config
+            .as_ref()
+            .unwrap()
+            .source
+            .blocked_patchpoint_instructions
+        {
+            log::info!("Following instructions are blocked via blocklist: {blocklist:?}");
+            patch_points.retain(|e| !blocklist.contains(&e.llvm_ins()));
+        }
+    }
+
+    fn retain_whitelisted(&self, patch_points: &mut Vec<MutationSite>) {
+        if let Some(allowed_patch_points) = self
+            .config
+            .as_ref()
+            .unwrap()
+            .source
+            .allowed_patch_points
+            .as_ref()
+        {
+            log::info!(
+                "Patch points are filtered according to allow list specified in the configuration"
+            );
+            patch_points.retain(|pp| allowed_patch_points.contains(&pp.id()));
+        }
+    }
+
     /// God nows why, but for a few targets the stackmap entries are misaligned.
     /// So, we simply remove those entries that do not contain a nop pattern at their
     /// corresponding vma.
-    fn remove_misaligned(&self, patch_points: &mut Vec<PatchPoint>) {
-        if let Some(config) = &self.config {
-            if config.general.jail_enabled() {
-                jail::acquire_privileges().unwrap();
-            }
-        }
+    fn check_alignment(&self, patch_points: &mut Vec<MutationSite>) {
         assert_eq!(PATCH_POINT_SIZE, 32);
-        let nop_pattern = b"\x2E\x66\x0F\x1F\x84\x00\x00\x02\x00\x00\x2E\x66\x0F\x1F\x84\x00\x00\x02\x00\x00\x2E\x66\x0F\x1F\x84\x00\x00\x02\x00\x00\x66\x90";
+        let nop_pattern = b"\x66\x66\x66\x66\x66\x2e\x66\x0f\x1f\x84\x00\x00\x02\x00\x00\x66\x66\x66\x66\x66\x2e\x66\x0f\x1f\x84\x00\x00\x02\x00\x00\x66\x90";
         patch_points.retain(|p| {
             let content = self.read_mem(p.vma() as usize, nop_pattern.len());
             if let Ok(content) = content {
-                content == nop_pattern
+                let aligned = content == nop_pattern;
+                if !aligned {
+                    log::warn!("Found misaligned patchpoint {:?}", p);
+                }
+                //assert_eq!(content, nop_pattern);
+                aligned
             } else {
-                false
+                unreachable!();
             }
         });
-        if let Some(config) = &self.config {
-            if config.general.jail_enabled() {
-                let (uid, gid) = config.general.jail_uid_gid().unwrap();
-                jail::drop_privileges(uid, gid, false).unwrap();
-            }
-        }
     }
 
     fn read_from_cache(
         &self,
-        cache: &HashMap<PathBuf, Arc<Vec<PatchPoint>>>,
-    ) -> Option<Arc<Vec<PatchPoint>>> {
+        cache: &HashMap<PathBuf, Arc<Vec<MutationSite>>>,
+    ) -> Option<Arc<Vec<MutationSite>>> {
         if let Some(v) = cache.get(&(self.path.clone())) {
             return Some(v.clone());
         }
         None
     }
 
-    pub fn resolve_patch_point_ids<I: Iterator<Item = PatchPointID>>(
+    pub fn resolve_patch_point_ids<I: Iterator<Item = MutationSiteID>>(
         &self,
         ids: I,
-    ) -> Result<Vec<PatchPoint>> {
+    ) -> Result<Vec<MutationSite>> {
         let ids: Vec<_> = ids.collect();
         let pps = self.get_patchpoints()?;
         let ret = pps
@@ -963,17 +1094,17 @@ impl Source {
 
     /// Dump the patchpoints to the working directory for later analysis.
     #[allow(unused)]
-    fn dump_patchpoints(&self, patch_points: &[PatchPoint]) {
+    fn dump_patchpoints(&self, patch_points: &[MutationSite]) {
         let mut path = self.state_dir.clone();
         path.push("patch_points.json");
-        PatchPoint::dump(&path, patch_points);
+        MutationSite::dump(&path, patch_points);
     }
 
     /// Try to get the reason why the child process terminated.
     /// If it is still alive, None ist returned.
     /// If is terminated gracefully, `.0` contains the exit code.
     /// If it was terminated by a signal, `.1` contains the signal.
-    pub fn try_get_child_exit_reason(&self) -> Option<(Option<i32>, Option<Signal>)> {
+    pub fn try_get_child_exit_reason(&mut self) -> Option<(Option<i32>, Option<Signal>)> {
         let status: libc::c_int = 0;
         let ret = unsafe {
             let pid = self.pid.unwrap();
@@ -981,6 +1112,8 @@ impl Source {
         };
         if ret > 0 {
             // Child exited
+            // make sure nobody tries to wait for the pid again.
+            self.pid.take();
             let mut exit_code = None;
             if libc::WIFEXITED(status) {
                 exit_code = Some(libc::WEXITSTATUS(status));
@@ -996,12 +1129,12 @@ impl Source {
 
     /// Stop the child process.
     pub fn stop(&mut self) -> Result<&Source, SourceError> {
+        log::debug!("Stopping source.");
+
         if let Some(pid) = self.pid.take() {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                // reap it
-                libc::waitpid(pid, std::ptr::null_mut() as *mut libc::c_int, 0);
-            }
+            stop_forkserver(pid);
+        } else {
+            log::debug!("Child was already reaped");
         }
 
         for e in [&self.mq_recv_name, &self.mq_send_name].iter() {
@@ -1147,6 +1280,9 @@ impl Source {
 
         let start_ts = Instant::now();
         let mut timeout_left = timeout;
+
+        let mut last_skipped_message_type = None;
+
         loop {
             Source::receive_message(aux_stream_handler, mq_recv, timeout_left, &mut buf)
                 .context(format!(
@@ -1161,9 +1297,13 @@ impl Source {
 
             let header = MsgHeader::try_from_bytes(&buf)?;
             if header.id == T::message_type() {
+                log::trace!("Got message of expected type {:?}", T::message_type());
                 let ret = T::try_from_bytes(&buf)?;
                 return Ok(ret);
+            } else if Some(header.id) == last_skipped_message_type {
+                continue;
             } else {
+                last_skipped_message_type = Some(header.id);
                 log::warn!(
                     "Skipping message of type {:?} while waiting for {:?} message.",
                     header.id,
@@ -1256,6 +1396,17 @@ impl Source {
     /// # Errors
     /// All returned errors must be considered as unrecoverable fatal error.
     pub fn run(&mut self, timeout: Duration) -> Result<RunResult> {
+        self.spawn(timeout)?;
+        self.wait_for_child_termination(timeout, false)
+    }
+
+    pub fn spawn(&mut self, timeout: Duration) -> Result<()> {
+        self.purge_workdir();
+        self.bind_ctr = 0;
+        self.listen_ctr = 0;
+
+        self.msg_buffer = Some(Vec::new());
+
         if cfg!(debug) && self.input_file.0.stream_len().unwrap() == 0 {
             log::warn!("Running without input! Is this intentional?");
         }
@@ -1268,6 +1419,30 @@ impl Source {
             .mq_send
             .as_ref()
             .expect("start() must be called first!");
+
+        // Request run
+        mq_send
+            .send_timeout(0, run_msg.to_bytes(), DEFAULT_SEND_TIMEOUT)
+            .context("Failed to send RunMessage")?;
+
+        // Retrive child sid thus we can kill the forked child if it is unresponsive.
+        log::trace!("Waiting for the child sid");
+        let pid_msg: ChildPid = self.wait_for_message(DEFAULT_RECEIVE_TIMEOUT)?;
+        log::trace!("Got child sid: {}", pid_msg.pid);
+        self.child_pid = Some(pid_msg);
+
+        Ok(())
+    }
+
+    pub fn wait_until_connect(&mut self, timeout: Duration) -> Result<WaitForPeerResult> {
+        assert!(!self
+            .config
+            .as_ref()
+            .unwrap()
+            .source
+            .is_server
+            .unwrap_or(false));
+
         let mq_recv = self
             .mq_recv
             .as_ref()
@@ -1277,65 +1452,37 @@ impl Source {
         // Scratch buffer.
         let mut buf: Vec<u8> = vec![0; mq_recv.attributes().max_msg_len];
 
-        // Vector used to store messages that preceded the termination message.
-        let mut msgs: Vec<ReceivableMessages> = Vec::new();
-
-        // Request run
-        mq_send
-            .send_timeout(0, run_msg.to_bytes(), DEFAULT_SEND_TIMEOUT)
-            .context("Failed to send RunMessage")?;
-
-        // Retrive child sid thus we can kill the forked child if it is unresponsive.
-        log::trace!("Waiting for the child sid");
-        Source::receive_message(
-            aux_stream_handler,
-            mq_recv,
-            DEFAULT_RECEIVE_TIMEOUT,
-            &mut buf,
-        )
-        .context("Failed to receive child pid")?;
-        let pid_msg = ChildPid::try_from_bytes(&buf)?;
-        log::trace!("Got child sid: {}", pid_msg.pid);
-
         // Wait for reply
         loop {
             // Get the next message
             match Source::receive_message(aux_stream_handler, mq_recv, timeout, &mut buf) {
                 Ok(_) => (),
                 Err(_) => {
-                    // The child did not terminated in time
-                    // => kill it and consume the resulting terminated message.
-                    log::trace!(
-                        "Did not receive any response in time. Manually killing the child."
-                    );
-                    let kill_child_ret = kill_child_process_group(&pid_msg);
-
-                    // Consume the TerminatedMessage that might be caused by our
-                    // killpg() call, or, if the child won the race be the actual
-                    // TerminatedMessage (in other words, we misinterpreted this as a timeout).
-                    // Anyways, there should be exactly one TerminatedMessage message. If not,
-                    // then this is a fatal error since the agents state becomes unknown.
-                    log::trace!("Waiting for termination acknowledgment.");
-                    let msg = self.wait_for_message::<TerminatedMessage>(DEFAULT_RECEIVE_TIMEOUT);
-                    if let Err(err) = msg {
-                        log::error!(
-                            "The agent failed to acknowledge our termination request. err={}, child_pid={}, kill_child_ret={:?}",
-                            err, pid_msg.pid, kill_child_ret
-                        );
-                        return Err(err.context("Expected TerminatedMessage after issuing killpg"));
-                    }
-
-                    return Ok(RunResult::TimedOut { msgs });
+                    self.kill_child_and_wait_for_termination()?;
+                    return Ok((RunResult::TimedOut {
+                        msgs: self.msg_buffer.take().unwrap(),
+                    })
+                    .into());
                 }
             }
 
             let header = MsgHeader::try_from_bytes(&buf)?;
             match header.id {
+                MessageType::AfterBind | MessageType::AfterListen => {
+                    return self.wait_until_connect(timeout)
+                }
+                MessageType::AfterConnect => {
+                    log::trace!("Got new message: {header:#?}");
+                    return Ok(WaitForPeerResult::Ready);
+                }
                 MessageType::MsgIdTracePointStat => {
                     log::trace!("Got MsgIdTracePointStat message");
-                    msgs.push(ReceivableMessages::TracePointStat(
-                        TracePointStat::try_from_bytes(&buf)?,
-                    ));
+                    self.msg_buffer
+                        .as_mut()
+                        .unwrap()
+                        .push(ReceivableMessages::TracePointStat(
+                            TracePointStat::try_from_bytes(&buf)?,
+                        ));
                 }
                 MessageType::MsgIdTerminated => {
                     let msg = TerminatedMessage::try_from_bytes(&buf)?;
@@ -1343,13 +1490,204 @@ impl Source {
                     log::trace!("Received MsgIdTerminated message.");
                     if exit_code >= 0 {
                         log::trace!("Child terminated");
-                        return Ok(RunResult::Terminated { exit_code, msgs });
+                        return Ok((RunResult::Terminated {
+                            exit_code,
+                            msgs: self.msg_buffer.take().unwrap(),
+                        })
+                        .into());
                     } else {
                         /* Signals are represented by negative exit codes */
                         log::trace!("Child was signalled");
-                        return Ok(RunResult::Signalled {
+                        return Ok((RunResult::Signalled {
                             signal: Signal::try_from(libc::WTERMSIG(-exit_code)).unwrap(),
-                            msgs,
+                            msgs: self.msg_buffer.take().unwrap(),
+                        })
+                        .into());
+                    }
+                }
+                _ => {
+                    let err_msg = format!("Unexpected bytes received: {:#?}", &buf[..64]);
+                    log::error!("{}", err_msg);
+                    return Err(anyhow!(err_msg).context("Error while processing received message"));
+                }
+            }
+        }
+    }
+
+    pub fn wait_until_listening(&mut self, timeout: Duration) -> Result<WaitForPeerResult> {
+        let mq_recv = self
+            .mq_recv
+            .as_ref()
+            .expect("start() must be called first!");
+        let aux_stream_handler = &mut self.aux_stream_assembler;
+
+        // Scratch buffer.
+        let mut buf: Vec<u8> = vec![0; mq_recv.attributes().max_msg_len];
+
+        // Wait for reply
+        loop {
+            // Get the next message
+            match Source::receive_message(aux_stream_handler, mq_recv, timeout, &mut buf) {
+                Ok(_) => (),
+                Err(_) => {
+                    self.kill_child_and_wait_for_termination()?;
+                    return Ok((RunResult::TimedOut {
+                        msgs: self.msg_buffer.take().unwrap(),
+                    })
+                    .into());
+                }
+            }
+
+            let header = MsgHeader::try_from_bytes(&buf)?;
+            match header.id {
+                MessageType::AfterConnect => return self.wait_until_listening(timeout),
+                MessageType::AfterBind => {
+                    self.bind_ctr += 1;
+                    log::trace!("Got new message: {header:#?}");
+                    if self
+                        .config
+                        .as_ref()
+                        .unwrap()
+                        .source
+                        .server_ready_on
+                        .unwrap_or(ServerReadySignalKind::Listen(0))
+                        == ServerReadySignalKind::Bind(self.bind_ctr - 1)
+                    {
+                        return Ok(WaitForPeerResult::Ready);
+                    } else {
+                        return self.wait_until_listening(timeout);
+                    }
+                }
+                MessageType::AfterListen => {
+                    log::trace!("Got new message: {header:#?}");
+                    self.listen_ctr += 1;
+                    if self
+                        .config
+                        .as_ref()
+                        .unwrap()
+                        .source
+                        .server_ready_on
+                        .unwrap_or(ServerReadySignalKind::Listen(0))
+                        == ServerReadySignalKind::Listen(self.listen_ctr - 1)
+                    {
+                        return Ok(WaitForPeerResult::Ready);
+                    } else {
+                        return self.wait_until_listening(timeout);
+                    }
+                }
+                MessageType::MsgIdTracePointStat => {
+                    log::trace!("Got MsgIdTracePointStat message");
+                    self.msg_buffer
+                        .as_mut()
+                        .unwrap()
+                        .push(ReceivableMessages::TracePointStat(
+                            TracePointStat::try_from_bytes(&buf)?,
+                        ));
+                }
+                MessageType::MsgIdTerminated => {
+                    let msg = TerminatedMessage::try_from_bytes(&buf)?;
+                    let exit_code = msg.exit_code;
+                    log::trace!("Received MsgIdTerminated message.");
+                    if exit_code >= 0 {
+                        log::trace!("Child terminated");
+                        return Ok((RunResult::Terminated {
+                            exit_code,
+                            msgs: self.msg_buffer.take().unwrap(),
+                        })
+                        .into());
+                    } else {
+                        /* Signals are represented by negative exit codes */
+                        log::trace!("Child was signalled");
+                        return Ok((RunResult::Signalled {
+                            signal: Signal::try_from(libc::WTERMSIG(-exit_code)).unwrap(),
+                            msgs: self.msg_buffer.take().unwrap(),
+                        })
+                        .into());
+                    }
+                }
+                _ => {
+                    let err_msg = format!("Unexpected bytes received: {:#?}", &buf[..64]);
+                    log::error!("{}", err_msg);
+                    return Err(anyhow!(err_msg).context("Error while processing received message"));
+                }
+            }
+        }
+    }
+
+    pub fn wait_for_child_termination(
+        &mut self,
+        timeout: Duration,
+        send_sigkill_immediately: bool,
+    ) -> Result<RunResult> {
+        let mq_recv = self
+            .mq_recv
+            .as_ref()
+            .expect("start() must be called first!");
+        let aux_stream_handler = &mut self.aux_stream_assembler;
+
+        // Scratch buffer.
+        let mut buf: Vec<u8> = vec![0; mq_recv.attributes().max_msg_len];
+
+        if send_sigkill_immediately {
+            log::trace!("Sending sigkill to child since send_sigkill_immediately was set");
+            // Not many things we can do if this fails, also this may just be caused by
+            // the child vanishing before it received the signal.
+            let _ = kill_child_process_group(self.child_pid.as_ref().unwrap());
+        }
+
+        // Wait for reply
+        loop {
+            // Get the next message
+            match Source::receive_message(aux_stream_handler, mq_recv, timeout, &mut buf) {
+                Ok(_) => (),
+                Err(_) => {
+                    self.kill_child_and_wait_for_termination()?;
+                    return Ok(RunResult::TimedOut {
+                        msgs: self.msg_buffer.take().unwrap(),
+                    });
+                }
+            }
+
+            let header = MsgHeader::try_from_bytes(&buf)?;
+            match header.id {
+                MessageType::AfterBind | MessageType::AfterListen | MessageType::AfterConnect => {
+                    log::trace!("Ignoring message {header:#?}");
+                }
+                MessageType::MsgIdTracePointStat => {
+                    log::trace!("Got MsgIdTracePointStat message");
+                    self.msg_buffer
+                        .as_mut()
+                        .unwrap()
+                        .push(ReceivableMessages::TracePointStat(
+                            TracePointStat::try_from_bytes(&buf)?,
+                        ));
+                }
+                MessageType::MsgIdTerminated => {
+                    let msg = TerminatedMessage::try_from_bytes(&buf)?;
+                    let exit_code = msg.exit_code;
+                    log::trace!("Received MsgIdTerminated message.");
+                    if exit_code >= 0 {
+                        log::trace!("Child terminated");
+                        return Ok(RunResult::Terminated {
+                            exit_code,
+                            msgs: self.msg_buffer.take().unwrap(),
+                        });
+                    } else {
+                        /* Signals are represented by negative exit codes */
+                        log::trace!("Child was signalled");
+                        let signal = match Signal::try_from(-exit_code) {
+                            Ok(signal) => signal,
+                            Err(err) => {
+                                log::error!(
+                                    "Failed to convert exit code {exit_code} to signal: {err}"
+                                );
+                                Signal::SIGBUS
+                            }
+                        };
+                        log::trace!("Received signal is : {signal:?}");
+                        return Ok(RunResult::Signalled {
+                            signal,
+                            msgs: self.msg_buffer.take().unwrap(),
                         });
                     }
                 }
@@ -1360,6 +1698,29 @@ impl Source {
                 }
             }
         }
+    }
+
+    fn kill_child_and_wait_for_termination(&mut self) -> Result<()> {
+        log::trace!("Did not receive any response in time. Manually killing the child.");
+        let kill_child_ret = kill_child_process_group(self.child_pid.as_ref().unwrap());
+        log::trace!("Waiting for termination acknowledgment.");
+        let msg = self.wait_for_message::<TerminatedMessage>(DEFAULT_RECEIVE_TIMEOUT);
+        // The child did not terminated in time
+        // => kill it and consume the resulting terminated message.
+
+        // Consume the TerminatedMessage that might be caused by our
+        // killpg() call, or, if the child won the race be the actual
+        // TerminatedMessage (in other words, we misinterpreted this as a timeout).
+        // Anyways, there should be exactly one TerminatedMessage message. If not,
+        // then this is a fatal error since the agents state becomes unknown.
+        if let Err(err) = msg {
+            log::error!(
+                "The agent failed to acknowledge our termination request. err={}, child_pid={}, kill_child_ret={:?}",
+                err, self.child_pid.as_ref().unwrap().pid, kill_child_ret
+            );
+            return Err(err.context("Expected TerminatedMessage after issuing killpg"));
+        }
+        Ok(())
     }
 
     pub fn mutation_cache_apply_fn<T, U>(&self, f: T) -> U
@@ -1388,8 +1749,13 @@ impl Source {
         self.mutation_cache.as_ptr()
     }
 
-    pub fn mutation_cache_replace(&mut self, other: &MutationCache) -> Result<()> {
-        self.mutation_cache().borrow_mut().replace(other)
+    ///
+    /// # Safety
+    /// This is only safe if no references acquired before calling this function call
+    /// are used after this function returns.
+    /// .
+    pub unsafe fn mutation_cache_replace(&mut self, other: &MutationCache) -> Result<()> {
+        self.mutation_cache().borrow_mut().replace_content(other)
     }
 
     /// Trace the childs execution.
@@ -1401,17 +1767,19 @@ impl Source {
             log::warn!("Tracing without input! Is this intentional?");
         }
 
-        // Enable tracing for all entries but do not touch the other flags.
-        self.mutation_cache().borrow_mut().iter_mut().for_each(|e| {
-            e.set_flag(MutationCacheEntryFlags::TracingEnabled);
-        });
-        self.sync_mutations()
-            .context("Failed to sync mce's before tracing")?;
+        self.enable_tracing()?;
 
         let res = self
             .run(timeout)
             .context("Unexpected error during execution")?;
 
+        self.disable_tracing_and_process_result(res)
+    }
+
+    pub fn disable_tracing_and_process_result(
+        &mut self,
+        res: RunResult,
+    ) -> Result<(RunResult, Trace)> {
         // Clear the tracing flag.
         self.mutation_cache().borrow_mut().iter_mut().for_each(|e| {
             e.unset_flag(MutationCacheEntryFlags::TracingEnabled);
@@ -1451,6 +1819,15 @@ impl Source {
         Ok((res, trace))
     }
 
+    pub fn enable_tracing(&mut self) -> Result<(), anyhow::Error> {
+        self.mutation_cache().borrow_mut().iter_mut().for_each(|e| {
+            e.set_flag(MutationCacheEntryFlags::TracingEnabled);
+        });
+        self.sync_mutations()
+            .context("Failed to sync mce's before tracing")?;
+        Ok(())
+    }
+
     // Try to remove all files in the workdir.
     fn _purge_workdir(&self) -> Result<()> {
         let mut delete_ctr = 0usize;
@@ -1474,7 +1851,12 @@ impl Source {
     }
 
     /// Try to remove all files in the workdir and recreate it afterwards.
-    fn purge_workdir(&self) {
+    fn purge_workdir(&mut self) {
+        self.purge_ctr += 1;
+        if self.purge_ctr % 1000 != 0 {
+            return;
+        }
+
         log::trace!("Purging workdir");
         if let Err(err) = self._purge_workdir() {
             log::warn!("Failed to purge workdir: {:#?}", err);
@@ -1485,34 +1867,33 @@ impl Source {
     /// Write `data` to the input channel of the source.
     #[inline]
     pub fn write(&mut self, data: &[u8]) {
-        self.purge_workdir();
+        match self.input_channel {
+            InputChannel::None => (),
+            InputChannel::Stdin => {
+                self.input_file.0.seek(SeekFrom::Start(0)).unwrap();
+                self.input_file.0.set_len(0).unwrap();
+                self.input_file.0.write_all(data).unwrap();
+                self.input_file.0.seek(SeekFrom::Start(0)).unwrap();
+                self.input_file.0.sync_all().unwrap();
+            }
+            InputChannel::File => {
+                let (_, path) = &mut self.input_file;
+                let path = PathBuf::from_str(path).unwrap();
+                set_perms_770_existing(&path);
 
-        if self.input_channel == InputChannel::None {
-            return;
-        }
-
-        if self.input_channel == InputChannel::File {
-            let (_, path) = &mut self.input_file;
-            let path = PathBuf::from_str(path).unwrap();
-            set_perms_770_existing(&path);
-
-            let mut new_file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(path)
-                .unwrap();
-            new_file.write_all(data).unwrap();
-            // drop new_file here, we do not need and open fd for this input mode.
-        } else if self.input_channel == InputChannel::Stdin {
-            self.input_file.0.seek(SeekFrom::Start(0)).unwrap();
-            self.input_file.0.set_len(0).unwrap();
-            self.input_file.0.write_all(data).unwrap();
-            self.input_file.0.seek(SeekFrom::Start(0)).unwrap();
-            self.input_file.0.sync_all().unwrap();
-        } else {
-            unreachable!();
+                let mut new_file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)
+                    .unwrap();
+                new_file.write_all(data).unwrap();
+                // drop new_file here, we do not need and open fd for this input mode.
+            }
+            InputChannel::Tcp | InputChannel::Udp => {
+                log::trace!("impl for write to networked apps needed")
+            }
         }
     }
 
@@ -1534,6 +1915,8 @@ impl Source {
             self.read_from_output_file(data);
         } else if self.output_channel == OutputChannel::Stdout {
             self.read_from_stdout(data);
+        } else if matches!(self.output_channel, OutputChannel::Tcp | OutputChannel::Udp) {
+            //no op
         } else {
             unreachable!();
         }
@@ -1605,11 +1988,55 @@ impl Source {
 
         Ok(())
     }
+
+    fn check_if_linked_against_asan(path: &PathBuf, _config: Option<&Config>) -> Result<()> {
+        let mut cmd = process::Command::new("nm");
+        cmd.args([&path]);
+
+        let output = cmd.output()?;
+        let stdout = String::from_utf8(output.stdout)?;
+        if stdout.contains("__asan") {
+            log::error!("Source application {path:?} appears to be build with ASAN. Please remove the instrumentation, since this will likely cause the program to terminate if mutations are applied.");
+            return Err(SourceError::FatalError(
+                "Target is build with ASAN enabled, which is not supported".to_owned(),
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn config(&self) -> &Config {
+        self.config.as_ref().unwrap()
+    }
+}
+
+fn stop_forkserver(pid: i32) {
+    log::debug!("Sending SIGTERM to source {pid}");
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+        // reap it
+        match wait_pid_timeout(pid, Some(DEFAULT_RECEIVE_TIMEOUT)) {
+            Ok(status) => log::debug!("Source forkserver terminated: {status:?}"),
+            Err(err) => {
+                log::error!("Source forkserver did not terminate after sending SIGTERM: {err:?}. Sending SIGKILL.");
+                libc::kill(pid, libc::SIGKILL);
+                match wait_pid_timeout(pid, Some(DEFAULT_RECEIVE_TIMEOUT))
+                    .context("Waiting for source forkserver termination after issuing SIGKILL")
+                {
+                    Ok(_) => log::error!("Forkserver terminated after sending SIGKILL"),
+                    Err(_) => {
+                        log::error!("Sending SIGKILL should cause the forkserver to terminate")
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The the permission of the existing file/folder `path` to 770.
-fn set_perms_770_existing(path: &Path) {
-    let parent = path.parent().unwrap();
+fn set_perms_770_existing(path_to_existing_file: &Path) {
+    let parent = path_to_existing_file.parent().unwrap();
     let mut perms = parent.metadata().unwrap().permissions();
     perms.set_mode(0o770);
     fs::set_permissions(parent, perms).unwrap();
@@ -1634,7 +2061,7 @@ fn kill_child_process_group(pid_msg: &ChildPid) -> Result<()> {
 ///     - VMAs are unique
 ///     - PatchPointIDs are unique
 ///     - Patch point shadows do not overlap
-fn sanity_check_patch_points(patch_points: &[PatchPoint]) {
+fn sanity_check_patch_points(patch_points: &[MutationSite]) {
     // Check for duplicated VMAs.
     let vmas = patch_points.iter().map(|e| e.vma()).collect::<HashSet<_>>();
     assert_eq!(vmas.len(), patch_points.len());
@@ -1658,7 +2085,7 @@ fn sanity_check_patch_points(patch_points: &[PatchPoint]) {
 }
 
 /// Get all patchpoints of the file backed `mappings`.
-fn parse_file_backed_mappings(mappings: Vec<&MapRange>) -> Vec<PatchPoint> {
+fn parse_file_backed_mappings(mappings: Vec<&MapRange>) -> Vec<MutationSite> {
     let mut processed_paths = HashSet::new();
     let mut patch_points = Vec::new();
 
@@ -1690,7 +2117,7 @@ fn parse_file_backed_mappings(mappings: Vec<&MapRange>) -> Vec<PatchPoint> {
             log::info!("Parsing stackmaps...");
             let stack_maps = StackMap::from_path(path).unwrap();
             for stack_map in stack_maps {
-                let mut tmp = patchpoint::from_stackmap(&stack_map, mapping, &elf_file);
+                let mut tmp = mutation_site::from_stackmap(&stack_map, mapping, &elf_file);
                 patch_points.append(&mut tmp);
             }
         } else {

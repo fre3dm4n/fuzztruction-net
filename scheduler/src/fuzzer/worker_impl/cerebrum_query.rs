@@ -1,9 +1,9 @@
 #![allow(unused)]
 
 use super::cerebrum::Cerebrum;
-use crate::{fuzzer::queue::QueueEntry, patchpoint::PatchPoint, trace::Trace};
+use crate::{fuzzer::queue::QueueEntry, mutation_site::MutationSite, trace::Trace};
 use fuzztruction_shared::{
-    mutation_cache::MutationCache, mutation_cache_entry::MutationCacheEntry, types::PatchPointID,
+    mutation_cache::MutationCache, mutation_cache_entry::MutationCacheEntry, types::MutationSiteID,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -21,7 +21,7 @@ impl CerebrumQuery<'_> {
     }
 
     /// Get all [PatchPointID]s that have not been reported as fuzzed yet.
-    pub fn patch_points_unfuzzed(&self) -> HashSet<PatchPointID> {
+    pub fn patch_points_unfuzzed(&self) -> HashSet<MutationSiteID> {
         let pp = &self.cerebrum.patch_points;
         pp.iter()
             .filter(|e| {
@@ -32,7 +32,7 @@ impl CerebrumQuery<'_> {
             .collect()
     }
 
-    pub fn patch_points_yielded(&self) -> HashSet<PatchPointID> {
+    pub fn patch_points_yielded(&self) -> HashSet<MutationSiteID> {
         let pp = &self.cerebrum.patch_points;
         pp.iter()
             .filter(|e| {
@@ -43,18 +43,18 @@ impl CerebrumQuery<'_> {
             .collect()
     }
 
-    pub fn patch_point_yield_prop(&self) -> HashMap<PatchPointID, f64> {
+    pub fn patch_point_yield_prop(&self) -> HashMap<MutationSiteID, f64> {
         todo!();
     }
 
-    pub fn patch_point_to_sink_edge(&self) -> HashMap<PatchPointID, u64> {
+    pub fn patch_point_to_sink_edge(&self) -> HashMap<MutationSiteID, u64> {
         todo!();
     }
 
     pub fn patch_point_yielding_msks(
         &self,
         entry: &QueueEntry,
-        id: PatchPointID,
+        id: MutationSiteID,
     ) -> Vec<Arc<[u8]>> {
         let mut entry_rw_guard = entry.stats_rw();
         let already_tried = entry_rw_guard.combined_with_mut();
@@ -100,7 +100,7 @@ impl CerebrumQuery<'_> {
     //     res
     // }
 
-    pub fn patch_points_in_same_function(&self, id: PatchPointID) -> HashSet<PatchPointID> {
+    pub fn patch_points_in_same_function(&self, id: MutationSiteID) -> HashSet<MutationSiteID> {
         let pp = self.cerebrum.resolve_pp_id(id);
         self.cerebrum
             .patch_points
@@ -122,7 +122,7 @@ impl CerebrumQuery<'_> {
         result
     }
 
-    pub fn patch_point_ids_to_patch_point(&self, ids: &[PatchPointID]) -> Vec<Arc<PatchPoint>> {
+    pub fn patch_point_ids_to_patch_point(&self, ids: &[MutationSiteID]) -> Vec<Arc<MutationSite>> {
         ids.iter()
             .map(|pp_id| self.cerebrum.resolve_pp_id(*pp_id))
             .collect()

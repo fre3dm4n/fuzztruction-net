@@ -1,3 +1,4 @@
+use byte_unit::Unit;
 use fuzztruction_shared::messages;
 use fuzztruction_shared::{
     communication_channel::{CommunicationChannel, CommunicationChannelError},
@@ -37,6 +38,9 @@ pub const HANDSHAKE_TIMEOUT: u64 = 1000 * 300;
 static INIT_DONE: AtomicBool = AtomicBool::new(false);
 // Is this the child running?
 pub static IS_CHILD: AtomicBool = AtomicBool::new(false);
+/// Whether we are running as a standalone application and are not connected
+/// to the coordinator.
+static STANDALONE: AtomicBool = AtomicBool::new(true);
 
 /// Map used to trace coverage and execution count of the patch points.
 static TRACE_MAP: Mutex<Option<tracing::TraceMap<u64>>> = Mutex::new(None);
@@ -90,9 +94,45 @@ impl<'a> Agent<'a> {
 /// Entrypoint of our agent which is called by a stub inserted right at the start
 /// of the source's main by our custom compiler pass.
 pub extern "C" fn __ft_auto_init() {
-    // dbg!("__ft_auto_init");
     if !INIT_DONE.swap(true, Ordering::SeqCst) {
         start_forkserver();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn __ft_after_listen() {
+    log::trace!("__ft_after_listen");
+    if !STANDALONE.load(Ordering::SeqCst) {
+        let msg = messages::AfterListen::new();
+        send_message(msg, DEFAULT_TIMEOUT_MS).unwrap();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn __ft_after_bind() {
+    log::trace!("__ft_after_bind");
+    if !STANDALONE.load(Ordering::SeqCst) {
+        let msg = messages::AfterBind::new();
+        send_message(msg, DEFAULT_TIMEOUT_MS).unwrap();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn __ft_server_ready() {
+    if !STANDALONE.load(Ordering::SeqCst) {
+        log::trace!("__ft_server_ready");
+        todo!();
+        // let msg = messages::AfterBind::new();
+        // send_message(msg, DEFAULT_TIMEOUT_MS).unwrap();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn __ft_after_connect() {
+    log::trace!("__ft_after_connect");
+    if !STANDALONE.load(Ordering::SeqCst) {
+        let msg = messages::AfterConnect::new();
+        send_message(msg, DEFAULT_TIMEOUT_MS).unwrap();
     }
 }
 
@@ -123,10 +163,19 @@ pub fn start_forkserver() {
     cc.unlink();
     drop(cc_guard);
 
+    STANDALONE.store(false, Ordering::SeqCst);
+
     let level = std::env::var(ENV_LOG_LEVEL).unwrap_or("Debug".to_owned());
     let level = log::Level::from_str(&level).unwrap();
     logging::setup_logger(level).unwrap();
     logging::setup_panic_logging();
+
+    // Limit maximum virtual memory size.
+    let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
+    rlim.rlim_cur = 1024 * 1024 * 1024 * 64;
+    rlim.rlim_max = 1024 * 1024 * 1024 * 64;
+    let ret = unsafe { libc::setrlimit(libc::RLIMIT_AS, &rlim as *const libc::rlimit) };
+    assert_eq!(ret, 0);
 
     log::info!("Starting forkserver");
     log::info!("Agent log level is {}", level);
@@ -201,14 +250,13 @@ fn sync_mutations(agent: &mut Agent, _msg: &SyncMutations) {
     // thus we can restore the original binary later. This will only snapshot
     // those patch points we never touched before.
     for entry in entries.iter() {
-        agent.jit.snapshot_patch_point(entry.clone());
+        agent.jit.snapshot_patch_point(entry);
     }
 
     // The function used to report patch point hits during tracing.
     let tracing_cb_fn = jit::NativeFunction::from_fn(__tracing_cb as usize, 1);
 
     for entry in entries.iter() {
-        //log::trace!("Processing: {:?}", &entry);
         let mut callables = Vec::new();
 
         // Having no mask and tracing disabled renders a MutationCacheEntry useless.
@@ -219,8 +267,7 @@ fn sync_mutations(agent: &mut Agent, _msg: &SyncMutations) {
         );
 
         if entry.msk_len() > 0 {
-            //log::trace!("Mutations are enabled for {:?}", entry);
-            let mutation_stub = agent.jit.gen_mutation(&entry, true);
+            let mutation_stub = agent.jit.gen_mutation(&entry);
             let mutation_stub = match mutation_stub {
                 Ok(e) => e,
                 Err(JitError::UnsupportedMutation(e)) => {
@@ -230,12 +277,10 @@ fn sync_mutations(agent: &mut Agent, _msg: &SyncMutations) {
             };
 
             let stub = agent.jit.allocate(mutation_stub).unwrap();
-            //log::trace!("Mutation Stub: {:#?}", stub);
             callables.push(stub);
         }
 
         if entry.is_flag_set(MutationCacheEntryFlags::TracingEnabled) {
-            //log:: log::trace!("Tracing is enabled for {:?}", entry);
             // Tracing for this entry was requested.
 
             // We pass our own id as argument to the callback.
@@ -323,7 +368,7 @@ fn run(agent: &mut Agent, _msg: &RunMessage) -> ProcessType {
 
             // Drop the communication channel to prevet child from sending
             // messages.
-            COMMUNICATION_CHANNEL.lock().unwrap().take();
+            //COMMUNICATION_CHANNEL.lock().unwrap().take();
 
             // Prevent the child from messing with the mutation cache. However, keep it mapped,
             // for accessing the mutation masks and updating runtime vars.
@@ -338,6 +383,16 @@ fn run(agent: &mut Agent, _msg: &RunMessage) -> ProcessType {
                 let ret = waitpid(pid, &mut child_status, 0);
                 assert!(ret == pid);
             }
+            // loop {
+            //     let ret = waitpid(pid, &mut child_status, 0);
+            //     assert!(ret == pid);
+            //     if ! libc::WIFSIGNALED(child_status)
+            //         || libc::WTERMSIG(child_status) != libc::SIGTERM
+            //     {
+            //         // call waitpid again if this was a SIGTERM
+            //         break;
+            //     }
+            // }
 
             if libc::WIFEXITED(child_status) {
                 terminated_msg.exit_code = libc::WEXITSTATUS(child_status);

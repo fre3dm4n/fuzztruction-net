@@ -1,36 +1,48 @@
 use std::{
-    cmp,
     collections::HashSet,
+    fs::File,
     hash::Hasher,
+    io::{Read, Seek},
     path::PathBuf,
+    process::{Child, Command, Stdio},
     sync::{Arc, RwLock},
+    thread,
     time::Instant,
 };
 
 use crate::{
     config::Config,
+    constants::{
+        CALIBRATION_MEASURE_CYCLES, DEFAULT_CALIBRATION_TIMEOUT, EXECUTION_TIMEOUT_MULTIPLYER,
+    },
     mutation_cache_ops::MutationCacheOpsEx,
+    networked::{get_consumer, get_producer, Client, Server, WaitForPeerResult},
     sink::{self, AflSink},
-    sink_bitmap::Bitmap,
+    sink_bitmap::{Bitmap, BitmapStatus},
     source::{self, Source},
     trace::Trace,
 };
 
 use ahash::AHasher;
-use anyhow::Result;
-use fuzztruction_shared::{mutation_cache::MutationCache, types::PatchPointID};
+use anyhow::{Context, Result};
+use byte_unit::n_mib_bytes;
+use fuzztruction_shared::{mutation_cache::MutationCache, types::MutationSiteID};
 use lazy_static::lazy_static;
-use log::trace;
+use nix::{
+    sys::signal::{kill, Signal},
+    unistd::Pid,
+};
+use wait_timeout::ChildExt;
+
 use std::time::Duration;
 use thiserror::Error;
 
 use super::{
+    common_networked::networked_common_calibration_run,
     queue::{Input, QueueEntry},
     worker::WorkerUid,
     worker_impl::{FuzzingPhase, MutatorType},
 };
-
-const CALIBRATION_MEASURE_CYCLES: u64 = 50;
 
 /// Different types of input that might be use the create new queue entries.
 #[allow(dead_code)]
@@ -51,6 +63,22 @@ impl InputType<'_> {
     }
 }
 
+#[derive(Debug)]
+pub enum ServerRunResult {
+    /// The Source is the server.
+    Source(source::RunResult),
+    /// This Sink is the server.
+    Sink(sink::RunResult),
+}
+
+// #[derive(Debug)]
+// pub enum ClientRunResult {
+//     /// The Source is the Client.
+//     Source(source::RunResult),
+//     /// The Sink is the Client.
+//     Sink(sink::RunResult),
+// }
+
 #[derive(Debug, Error)]
 #[allow(unused)]
 pub enum CalibrationError {
@@ -62,8 +90,14 @@ pub enum CalibrationError {
     SourceExecutionFailed(source::RunResult),
     #[error("Error while executing the sink target {0:#?}")]
     SinkExecutionFailed(sink::RunResult),
+    #[error("Error while executing the server {0:#?}")]
+    ServerExecutionFailed(ServerRunResult),
+    // #[error("Error while executing the client {0:#?}")]
+    // ClientExecutionFailed(ClientRunResult),
     #[error("Source did not produce any output.")]
     NoSourceOutput,
+    #[error("The execution durations varied by an unexpected high degree.")]
+    ExecutionDurationVarianceTooHight,
 }
 
 #[derive(Debug, Error)]
@@ -78,6 +112,56 @@ pub enum ExecError {
     /// The source execution was successfull, but we already saw the produced output (hash).
     #[error("Duplicated Output.")]
     DuplicatedOutput,
+}
+
+struct TcpDumpInstance {
+    pub pcap_file: File,
+    pub child: Option<Child>,
+}
+
+impl Drop for TcpDumpInstance {
+    fn drop(&mut self) {
+        // file is a tempfile, thus we do not need to take care of it.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            child
+                .wait_timeout(Duration::from_secs(120))
+                .expect("Failed to kill tcpdump");
+        }
+    }
+}
+
+fn start_tcpdump(_config: &Config) -> Option<TcpDumpInstance> {
+    // let dst_port = config
+    //     .server_port()
+    //     .expect("Server port not set in the config");
+
+    let pcap_file = match tempfile::tempfile() {
+        Ok(path) => path,
+        Err(err) => {
+            log::warn!("Error while allocating temporary pcap file: {err:#?}");
+            return None;
+        }
+    };
+
+    let mut cmd = Command::new("/usr/bin/tcpdump");
+    cmd.stdout(pcap_file.try_clone().unwrap());
+    cmd.stderr(Stdio::null());
+
+    cmd.args(["-i", "lo", "-U"]);
+    cmd.args(["-w", "-"]);
+
+    let child = match cmd.spawn() {
+        Ok(child) => Some(child),
+        Err(err) => {
+            log::warn!("Failed to run tcpdump: {err:#?}");
+            return None;
+        }
+    };
+
+    // Give tcpflow some time to spin up
+    thread::sleep(Duration::from_secs(1));
+    Some(TcpDumpInstance { pcap_file, child })
 }
 
 /// Produces a new QueueEntry from an input and mutations (that have been previously configured via the soruces mutation cache).
@@ -97,20 +181,32 @@ pub fn common_calibrate(
     finder: Option<WorkerUid>,
     phase: Option<FuzzingPhase>,
     mutator: Option<MutatorType>,
-    patch_point: Option<PatchPointID>,
+    patch_point: Option<MutationSiteID>,
+    is_crash: bool,
+    parent: Option<Arc<QueueEntry>>,
 ) -> Result<QueueEntry> {
-    // Whats about the first observed run result? Pass it as arg?
     let data = input.bytes();
 
     let mut sink_input = Vec::<u8>::with_capacity(4096);
-    let mut coverage_hashes_non_classified = HashSet::new();
+    let mut bitmaps = Vec::new();
+
+    let mut tcpdump_instance = start_tcpdump(config);
 
     // Get the default timeout value.
-    let default_timeout = config.general.timeout;
+    let mut default_timeout = parent
+        .map(|e| {
+            e.avg_exec_duration_raw()
+                .mul_f64(EXECUTION_TIMEOUT_MULTIPLYER)
+        })
+        .unwrap_or(DEFAULT_CALIBRATION_TIMEOUT);
 
     let mut exec_durations = Vec::with_capacity(CALIBRATION_MEASURE_CYCLES.try_into().unwrap());
+    if config.sink.send_sigterm {
+        default_timeout *= 2;
+    }
 
-    trace!("Doing {} calibration runs", CALIBRATION_MEASURE_CYCLES);
+    let mut crash_did_not_crash_ctr = 0;
+
     for _ in 0..CALIBRATION_MEASURE_CYCLES {
         let cycle_start_ts = Instant::now();
 
@@ -120,43 +216,53 @@ pub fn common_calibrate(
 
         log::trace!("calibration run result: {:?}", sink_res);
         match sink_res {
-            sink::RunResult::Terminated(..) => (),
+            sink::RunResult::Terminated(..) => {
+                if is_crash {
+                    crash_did_not_crash_ctr += 1;
+                }
+            }
+            sink::RunResult::Signalled(..) if is_crash => (),
             _ => {
                 // Anything else than Terminated is considered a failed calibration.
                 return Err(CalibrationError::SinkExecutionFailed(sink_res).into());
             }
         }
-        exec_durations.push(cycle_start_ts.elapsed());
+        let calibration_round_duration = cycle_start_ts.elapsed();
+        if !config.sink.send_sigterm && calibration_round_duration > default_timeout {
+            return Err(CalibrationError::ExecutionDurationVarianceTooHight.into());
+        }
 
-        // Note the hash (without classification), thus we can later check for non determinism.
-        let cov_hash_non_classified = sink.bitmap().hash32();
-        coverage_hashes_non_classified.insert(cov_hash_non_classified);
-
-        sink.bitmap().classify_counts();
+        exec_durations.push(calibration_round_duration);
+        let bitmap = sink.bitmap();
+        bitmap.classify_counts();
+        bitmaps.push(bitmap.clone());
         if let Some(virgin_map) = &mut virgin_map {
-            sink.bitmap().has_new_bit(virgin_map);
+            // this is done for each iteration, such that unstable bits are cleared as well.
+            bitmap.has_new_bit(virgin_map);
         }
     }
 
     // Add some offset to account for variations.
-    let timeout = cmp::min(
-        exec_durations.iter().max().unwrap(),
-        &config.general.timeout,
-    );
+    let timeout = exec_durations.iter().max().unwrap();
 
     // Check whether the coverage output is deterministic.
     let mut sink_unstable = false;
-    if coverage_hashes_non_classified.len() > 1 {
+    if bitmaps
+        .iter()
+        .map(|map| map.hash32())
+        .collect::<HashSet<_>>()
+        .len()
+        > 1
+    {
         if config.sink.allow_unstable_sink {
-            log::warn!("Sink is unstable, but this is currently allowed.");
+            log::debug!("Sink is unstable, but this is allowed.");
             sink_unstable = true;
         } else {
             return Err(CalibrationError::SinkUnstable("Varying coverage.".to_owned()).into());
         }
     }
 
-    // The runs where deterministic. Thus the last produced bitmap is a representant
-    // of all previous runs.
+    // We take the hash of the last bitmap, even if this was an unstable run.
     let bitmap = sink.bitmap();
     bitmap.classify_counts();
     let qe_hash = bitmap.hash32();
@@ -168,12 +274,69 @@ pub fn common_calibrate(
     };
 
     let mut mc = source.mutation_cache().borrow().try_clone()?;
-    mc.purge_nop_entries();
+    let mutation_bytes = unsafe {
+        // We are working on a copy of the mutation cache, thus this is safe because
+        // there are no pointers into this cache.
+        mc.purge_nop_entries();
+        mc.save_bytes()
+    };
+
+    if let Some(tcpdump_instance) = tcpdump_instance.as_mut() {
+        let mut child = tcpdump_instance.child.take().unwrap();
+        // Give it some time to record all remaining packages :)
+        thread::sleep(Duration::from_secs(2));
+        let pidfd = Pid::from_raw(child.id().try_into().unwrap());
+        if let Err(err) = kill(pidfd, Signal::SIGTERM) {
+            log::warn!("Failed to kill tcpdump: {err:#?}");
+        } else {
+            match child.wait_timeout(Duration::from_secs(30)) {
+                Ok(Some(_)) => (),
+                Ok(None) => {
+                    // we hit the timeout
+                    log::warn!("tcpdump did not terminate in time");
+                    if let Err(err) = child.kill() {
+                        log::warn!("Failed to send sigkill: {err:#?}");
+                    }
+                    child
+                        .wait_timeout(Duration::from_secs(30))
+                        .expect("Failed to kill tcpdump");
+                }
+                Err(err) => log::warn!("Error while waiting for tcpdump: {err:#?}"),
+            }
+        }
+    }
+
+    let mut pcap = if let Some(tcpdump_instance) = &mut tcpdump_instance {
+        let file = &mut tcpdump_instance.pcap_file;
+        file.rewind().unwrap();
+
+        let mut buf = Vec::new();
+        match file.read_to_end(&mut buf) {
+            Ok(size) => {
+                log::info!("Recorded a PCAP of size {size} during calibration.");
+                Some(buf)
+            }
+            Err(err) => {
+                log::warn!("Failed to read pcap file: {err:#?}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if pcap
+        .as_ref()
+        .map(|f| f.len() > n_mib_bytes!(4) as usize)
+        .unwrap_or(false)
+    {
+        log::info!("Recorded pcap is too big, dropping");
+        pcap.take();
+    }
 
     let mut qe = QueueEntry::new(
         qe_input,
-        chrono::Utc::now(),
-        Some(&mc.save_bytes()),
+        Some(&mutation_bytes),
         qe_hash,
         *timeout,
         sink_unstable,
@@ -182,7 +345,18 @@ pub fn common_calibrate(
         phase,
         mutator,
         patch_point,
+        is_crash,
+        pcap,
     );
+
+    if is_crash && crash_did_not_crash_ctr > 0 {
+        log::warn!(
+            "Crashing queue entry {:?} only crashed {} of {} times during calibration",
+            qe.id(),
+            CALIBRATION_MEASURE_CYCLES - crash_did_not_crash_ctr,
+            CALIBRATION_MEASURE_CYCLES
+        );
+    }
 
     if let InputType::Parent(parent) = input {
         qe.set_parent(parent);
@@ -192,31 +366,33 @@ pub fn common_calibrate(
     Ok(qe)
 }
 
-//FIXME: Whats about multiple sinks / other sink type?
-/// input, source, sink, fn_virgin_map -> RunResult
 #[inline]
-pub fn common_calibration_run(
-    _config: &Config,
+fn common_calibration_run(
+    config: &Config,
     source: &mut Source,
     sink: &mut AflSink,
     data: &[u8],
     timeout: Duration,
     sink_input: &mut Vec<u8>,
 ) -> Result<sink::RunResult> {
-    source.write(data);
-    let success = source.run(timeout)?;
-    match success {
-        source::RunResult::Terminated { .. } => (),
-        _ => return Err(CalibrationError::SourceExecutionFailed(success).into()),
-    }
-    source.read(sink_input);
-    if sink_input.is_empty() {
-        return Err(CalibrationError::NoSourceOutput.into());
-    }
+    if config.target_uses_network() {
+        networked_common_calibration_run(config, source, sink, data, timeout)
+    } else {
+        source.write(data);
+        let success = source.run(timeout)?;
+        match success {
+            source::RunResult::Terminated { .. } => (),
+            _ => return Err(CalibrationError::SourceExecutionFailed(success).into()),
+        }
+        source.read(sink_input);
+        if sink_input.is_empty() {
+            return Err(CalibrationError::NoSourceOutput.into());
+        }
 
-    // Run the sink.
-    sink.write(sink_input);
-    sink.run(timeout)
+        // Run the sink.
+        sink.write(sink_input);
+        sink.run(timeout)
+    }
 }
 
 lazy_static! {
@@ -243,7 +419,6 @@ pub fn common_run(
         return Err(ExecError::NoSourceOutput.into());
     }
 
-    //? Is 64 bit enough for us?
     let mut hasher = AHasher::default();
     hasher.write(scratch_buffer);
     let h = hasher.finish();
@@ -265,43 +440,103 @@ pub fn common_run(
 
 #[inline]
 pub fn common_trace(
-    _config: &Config,
+    config: &Config,
     source: &mut Source,
+    sink: &mut AflSink,
     data: &[u8],
     timeout: Duration,
     sink_input: &mut Vec<u8>,
 ) -> Result<Trace> {
     let pp = source.get_patchpoints()?;
     let mut trace_mc = MutationCache::from_patchpoints(pp.iter())?;
-    trace_mc.remove_const_type();
 
     let current_mc = source.mutation_cache();
-    let mc_backup = current_mc.borrow_mut().save_bytes();
+    let mc_backup = current_mc.borrow_mut().try_clone()?;
 
-    trace_mc.union_and_replace(&current_mc.borrow());
-    source.mutation_cache_replace(&trace_mc)?;
+    unsafe {
+        // Safety: There are no pointers into `trace_mc`
+        trace_mc.union_and_replace(&current_mc.borrow());
+    }
 
-    source.write(data);
-    let res = source.trace(timeout);
+    unsafe {
+        // Safety: `common_trace` is called initially on QueueEntry's before they are fuzzed,
+        // thus there are no pointers into the mutation cache.
+        // Furthermore, the `enable_tracing` call below causes the pointers
+        // to be refreshed on the agent side (via a sync message).
+        source.mutation_cache_replace(&trace_mc)?;
+    }
+
+    let trace_result =
+        if config.target_uses_network() {
+            let (mut client, mut server) = if config.source.is_server.unwrap() {
+                (Client::AflSink(sink), Server::Source(source))
+            } else {
+                (Client::Source(source), Server::AflSink(sink))
+            };
+
+            get_producer(&mut client, &mut server).enable_tracing()?;
+
+            server.spawn(timeout).context("Executing server")?;
+            let ret = server
+                .wait_until_listening(timeout)
+                .context("Waiting for the server to be ready to accept connections")?;
+            match ret {
+                WaitForPeerResult::Terminated(_)
+                | WaitForPeerResult::Signalled(_)
+                | WaitForPeerResult::TimedOut => {
+                    if config.source.is_server.unwrap() {
+                        return Err(CalibrationError::ServerExecutionFailed(
+                            ServerRunResult::Source(ret.try_into().unwrap()),
+                        )
+                        .into());
+                    } else {
+                        return Err(CalibrationError::ServerExecutionFailed(
+                            ServerRunResult::Sink(ret.try_into().unwrap()),
+                        )
+                        .into());
+                    }
+                }
+                WaitForPeerResult::Ready => (),
+            }
+
+            client.spawn(timeout).context("Executing client")?;
+
+            // Wait for the producer to terminate.
+            let producer_result = get_producer(&mut client, &mut server)
+                .wait_for_child_termination(timeout, false)?;
+
+            // kill the consumer if it is still running
+            let consumer = get_consumer(&mut client, &mut server);
+            let _consumer_result = consumer.wait_for_child_termination(timeout, true, None)?;
+
+            get_producer(&mut client, &mut server)
+                .disable_tracing_and_process_result(producer_result)
+        } else {
+            source.write(data);
+            source.trace(timeout)
+        };
 
     // Restore previous state of the MC.
-    let mut old_mc = MutationCache::new()?;
-    old_mc.load_bytes(&mc_backup)?;
-    source.mutation_cache_replace(&old_mc)?;
+    unsafe {
+        // Safety: We just traced this entry, so there are no pointers pointing into the cache.
+        source.mutation_cache_replace(&mc_backup)?;
+    }
 
-    if let Ok((run_result, trace)) = res {
+    if let Ok((run_result, trace)) = trace_result {
         let trace = match run_result {
             source::RunResult::Terminated { .. } => trace,
-            _ => return Err(CalibrationError::SourceExecutionFailed(run_result).into()),
+            _ => {
+                return Err(CalibrationError::SourceExecutionFailed(run_result).into());
+            }
         };
 
         source.read(sink_input);
-        if sink_input.is_empty() {
+        if !config.target_uses_network() && sink_input.is_empty() {
             return Err(CalibrationError::NoSourceOutput.into());
         }
 
         Ok(trace)
     } else {
-        Err(res.unwrap_err())
+        Err(trace_result.unwrap_err())
     }
 }

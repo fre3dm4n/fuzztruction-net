@@ -7,7 +7,7 @@ use fuzztruction_shared::{
 use log::Record;
 use std::{panic, path::PathBuf, process};
 
-use crate::agent;
+use crate::agent::{self};
 
 pub fn setup_logger(level: log::Level) -> Result<(), fern::InitError> {
     fern::Dispatch::new()
@@ -53,7 +53,7 @@ pub fn log_to_posix_mq(record: &Record) {
     let mut debug_stream = AuxStreamBuilder::new(AuxStreamType::LogRecord);
     let msgs = debug_stream.from_str(&msg).build();
     for m in msgs.into_iter() {
-        let r = agent::send_message(m, 60000);
+        let r = agent::send_message(m, 10000);
         if let Err(e) = r {
             eprintln!("Failed to log message: {}", e);
         }

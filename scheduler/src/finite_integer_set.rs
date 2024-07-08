@@ -5,19 +5,11 @@ use std::{
     marker::PhantomData,
 };
 
-use fuzztruction_shared::types::PatchPointID;
 use rand::{
     prelude::{IteratorRandom, SliceRandom},
     thread_rng,
 };
 use serde::{Deserialize, Serialize};
-
-use crate::constants::{MAX_PATCHPOINT_CNT, MAX_QUEUE_ENTRY_CNT};
-
-use super::queue::QueueEntryId;
-
-pub type PatchPointIDSet = FiniteIntegerSet<PatchPointID, MAX_PATCHPOINT_CNT>;
-pub type QueueIDDSet = FiniteIntegerSet<QueueEntryId, MAX_QUEUE_ENTRY_CNT>;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FiniteIntegerSet<U, const N: usize> {
@@ -108,6 +100,7 @@ where
         ret
     }
 
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.size()
     }
@@ -476,6 +469,6 @@ mod test {
     fn sym_diff() {
         let s0 = set32!(1usize, 2usize, 12usize, 13usize);
         let s1 = set32!(1usize, 2usize, 8usize, 12usize, 13usize);
-        assert_eq!(s0.symm_diff(&s1), set32!(8usize));
+        assert_eq!(s0.symm_diff(s1), set32!(8usize));
     }
 }

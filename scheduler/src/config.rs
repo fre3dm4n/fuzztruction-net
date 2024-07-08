@@ -3,11 +3,14 @@ use std::path::Path;
 use std::{collections::HashSet, path::PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use serde::Serialize;
+use fuzztruction_shared::types::MutationSiteID;
+use llvm_stackmap::LLVMInstruction;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 
 use crate::io_channels::{InputChannel, OutputChannel};
+use crate::networked::ServerReadySignalKind;
 use yaml_rust::{ScanError, Yaml, YamlLoader};
 
 use std::fmt::Debug;
@@ -19,11 +22,17 @@ use regex::Regex;
 #[derive(Debug, Clone, Copy)]
 pub struct FromStrDuration(pub time::Duration);
 
+#[derive(Debug, Clone)]
+pub enum TransportType {
+    TCP,
+    UDP,
+}
+
 impl FromStr for FromStrDuration {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let re = Regex::new("([0-9]+)(s|m|h|d|)").unwrap();
+        let re = Regex::new("([0-9]+)(s|m|h|d|a)").unwrap();
         let matches = re
             .captures(s)
             .ok_or(format!("Invalid duration format ({})!", s))?;
@@ -42,6 +51,7 @@ impl FromStr for FromStrDuration {
             "m" => amount * 1000 * 60,
             "h" => amount * 1000 * 3600,
             "d" => amount * 1000 * 3600 * 24,
+            "a" => amount * 1000 * 3600 * 24 * 365,
             _ => unreachable!(),
         };
         Ok(FromStrDuration(time::Duration::from_millis(millis)))
@@ -64,6 +74,15 @@ pub struct SourceConfig {
     pub log_stdout: bool,
     /// Whether to log stderr during execution.
     pub log_stderr: bool,
+    /// Whether this is a server application.
+    pub is_server: Option<bool>,
+    pub server_port: Option<String>,
+    pub server_ready_on: Option<ServerReadySignalKind>,
+    /// List of PatchPointIDs that are allowed to be mutated.
+    pub allowed_patch_points: Option<Vec<MutationSiteID>>,
+    pub max_patch_points: Option<i64>,
+    pub blocked_patchpoint_instructions: Option<Vec<LLVMInstruction>>,
+    pub working_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -100,8 +119,8 @@ impl Default for DiscoveryPhaseConfig {
             enabled: true,
             batch_size: 50,
             terminate_when_finished: false,
-            batch_cov_timeout: Duration::from_secs(60 * 5),
-            phase_cov_timeout: Duration::from_secs(60 * 15),
+            batch_cov_timeout: Duration::from_secs(60 * 10),
+            phase_cov_timeout: Duration::from_secs(60 * 20),
         }
     }
 }
@@ -115,7 +134,7 @@ pub struct MutatePhaseConfig {
 impl Default for MutatePhaseConfig {
     fn default() -> Self {
         Self {
-            weight: 50,
+            weight: 40,
             entry_cov_timeout: Duration::from_secs(60 * 15),
         }
     }
@@ -134,8 +153,8 @@ pub struct AddPhaseConfig {
 impl Default for AddPhaseConfig {
     fn default() -> Self {
         Self {
-            weight: 1,
-            batch_size: 30,
+            weight: 3,
+            batch_size: 12,
             select_unfuzzed_weight: 1,
             select_yielding_weight: 1,
             select_random_weight: 1,
@@ -164,28 +183,20 @@ pub struct CombinePhaseConfig {
 impl Default for CombinePhaseConfig {
     fn default() -> Self {
         Self {
-            weight: 5,
+            weight: 10,
             entry_cov_timeout: Duration::from_secs(60 * 10),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AflPlusPlusConfig {
-    pub input_dir: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct QSYMConfig {
-    input_path: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct SinkConfig {
-    pub env: Vec<(String, String)>,
     /// Path to the Sink binary.
     pub bin_path: PathBuf,
+    /// Arguments passed to the binary.
     pub arguments: Vec<String>,
+    /// Environment variables used for the sink binary.
+    pub env: Vec<(String, String)>,
     /// Type of input consumed by the Sink binary.
     pub input_type: InputChannel,
     /// Type of output produced by the Sink binary.
@@ -196,6 +207,86 @@ pub struct SinkConfig {
     pub log_stderr: bool,
     /// Allow the sink to produce different coverage maps for the same input.
     pub allow_unstable_sink: bool,
+    /// Whether this is a server application.
+    pub is_server: Option<bool>,
+    pub server_port: Option<String>,
+    pub server_ready_on: Option<ServerReadySignalKind>,
+    /// The working directory that should be used.
+    pub working_dir: Option<PathBuf>,
+    pub send_sigterm: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinkCovConfig {
+    /// The coverage binary.
+    pub bin_path: PathBuf,
+    /// The environment used for the coverage binary.
+    pub env: Vec<(String, String)>,
+    pub working_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AflNetConfig {
+    /// Environment used during binary
+    pub env: Vec<(String, String)>,
+    /// Path to the vanilla binary
+    pub bin_path: PathBuf,
+    pub input_dir: PathBuf,
+    pub protocol: String,
+    pub netinfo: String,
+    pub send_sigterm: bool,
+    pub enable_state_aware_mode: bool,
+}
+
+impl AflNetConfig {
+    pub fn transport_type(&self) -> TransportType {
+        if self.netinfo.to_lowercase().starts_with("tcp") {
+            TransportType::TCP
+        } else if self.netinfo.to_lowercase().starts_with("udp") {
+            TransportType::UDP
+        } else {
+            panic!("Unknown transport protocol in netinfo: {}", self.netinfo);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SGFuzzConfig {
+    pub bin_path: PathBuf,
+    /// Environment used during binary
+    pub env: Vec<(String, String)>,
+    pub args: Option<Vec<String>>,
+    /// Path to the vanilla binary
+    pub input_dir: PathBuf,
+    pub netinfo: String,
+}
+
+impl SGFuzzConfig {
+    pub fn dst_port(&self) -> u16 {
+        let netinfo = self.netinfo.split('/');
+        netinfo.last().unwrap().parse().unwrap()
+    }
+
+    pub fn transport_type(&self) -> TransportType {
+        if self.netinfo.to_lowercase().starts_with("tcp") {
+            TransportType::TCP
+        } else if self.netinfo.to_lowercase().starts_with("udp") {
+            TransportType::UDP
+        } else {
+            panic!("Unknown transport protocol in netinfo: {}", self.netinfo);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateAflConfig {
+    pub bin_path: PathBuf,
+    pub env: Vec<(String, String)>,
+    pub input_dir: PathBuf,
+    pub protocol: String,
+    pub netinfo: String,
+    pub send_sigterm: bool,
+    pub enable_state_aware_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,32 +299,67 @@ pub struct VanillaConfig {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SymccConfig {
-    /// Environment used during binary
-    pub env: Vec<(String, String)>,
-    /// Path to the vanilla binary
-    pub bin_path: PathBuf,
-    /// Binary compiled with plain afl instrumentation
-    pub afl_bin_path: PathBuf,
-    /// Environment used for the symcc AFL binary
-    pub afl_bin_env: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct GeneralConfig {
     pub input_dir: PathBuf,
     pub work_dir: PathBuf,
-    pub timeout: Duration,
     pub tracing_timeout: Duration,
-    pub purge_workdir: bool,
     pub jail_uid: Option<u32>,
     pub jail_gid: Option<u32>,
+    pub jail_drop_to_sudo_callee: bool,
 }
 
 impl GeneralConfig {
-    pub fn traces_directory(&self) -> PathBuf {
+    pub fn aflnet_workdir(&self) -> PathBuf {
         let mut ret = self.work_dir.clone();
-        ret.push("traces");
+        ret.push("aflnet-workdir");
+        ret
+    }
+
+    pub fn interesting_pcaps_path(&self) -> PathBuf {
+        let mut ret = self.work_dir.clone();
+        ret.push("interesting-pcaps");
+        ret
+    }
+
+    pub fn crashing_pcaps_path(&self) -> PathBuf {
+        let mut ret = self.work_dir.clone();
+        ret.push("crashing-pcaps");
+        ret
+    }
+
+    pub fn stateafl_workdir(&self) -> PathBuf {
+        let mut ret = self.work_dir.clone();
+        ret.push("stateafl-workdir");
+        ret
+    }
+
+    pub fn sgfuzz_workdir(&self) -> PathBuf {
+        let mut ret = self.work_dir.clone();
+        ret.push("sgfuzz-workdir");
+        ret
+    }
+
+    pub fn sgfuzz_seed_out_dir(&self) -> PathBuf {
+        let mut ret = self.sgfuzz_workdir();
+        ret.push("findings");
+        ret
+    }
+
+    pub fn sgfuzz_seed_with_ts_out_dir(&self) -> PathBuf {
+        let mut ret = self.sgfuzz_workdir();
+        ret.push("findings-ts");
+        ret
+    }
+
+    pub fn sgfuzz_crash_out_dir(&self) -> PathBuf {
+        let mut ret = self.sgfuzz_workdir();
+        ret.push("crashes");
+        ret
+    }
+
+    pub fn llvm_cov_directory(&self) -> PathBuf {
+        let mut ret = self.work_dir.clone();
+        ret.push("llvm-cov");
         ret
     }
 
@@ -252,6 +378,18 @@ impl GeneralConfig {
     pub fn crashing_path(&self) -> PathBuf {
         let mut ret = self.work_dir.clone();
         ret.push("crashing");
+        ret
+    }
+
+    pub fn pcap_path(&self) -> PathBuf {
+        let mut ret = self.work_dir.clone();
+        ret.push("pcaps");
+        ret
+    }
+
+    pub fn asan_reports_path(&self) -> PathBuf {
+        let mut ret = self.work_dir.clone();
+        ret.push("asan");
         ret
     }
 
@@ -296,12 +434,35 @@ pub struct Config {
     pub phases: PhasesConfig,
     /// Attributes related to the sink application.
     pub sink: SinkConfig,
+    /// Attributes related to the coverage sink binary.
+    pub sink_cov: Option<SinkCovConfig>,
     /// Attributes related to the vanilla application.
     pub vanilla: VanillaConfig,
-    /// Attributes related to AFL++ fuzzer
-    pub aflpp: Option<AflPlusPlusConfig>,
-    /// Attrbiutes realted to the SymCC fuzzer.
-    pub symcc: Option<SymccConfig>,
+    /// Config for the AFL-Net fuzzer.
+    pub aflnet: Option<AflNetConfig>,
+    /// Config for the state AFL fuzzer.
+    pub stateafl: Option<StateAflConfig>,
+    /// Config for the SGFuzz fuzzer.
+    pub sgfuzz: Option<SGFuzzConfig>,
+}
+
+impl Config {
+    pub fn target_uses_network(&self) -> bool {
+        matches!(
+            self.source.input_type,
+            InputChannel::Tcp | InputChannel::Udp
+        )
+    }
+
+    pub fn server_port(&self) -> Option<String> {
+        if self.source.is_server.unwrap_or(false) {
+            self.source.server_port.clone()
+        } else if self.sink.is_server.unwrap_or(false) {
+            self.sink.server_port.clone()
+        } else {
+            unreachable!()
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -381,8 +542,6 @@ trait PathValidator {
     fn not_path_exists(&self) -> Result<(), anyhow::Error>;
 }
 
-// TODO: temp fix. sorry :(
-// we want attributes in struct
 impl PathValidator for PathBuf {
     fn path_exists(&self) -> Result<()> {
         match self.exists() {
@@ -447,7 +606,7 @@ impl Validator for SinkConfig {
     }
 }
 
-impl Validator for SymccConfig {
+impl Validator for AflNetConfig {
     fn validate(&self) -> Result<()> {
         self.bin_path
             .path_exists()
@@ -484,8 +643,66 @@ impl TryFromYaml for String {
 }
 
 /// Try to convert a yaml attribute value into a String.
-impl TryFromYaml for Vec<String> {
-    fn try_from_yaml(_builder: &ConfigBuilder, yaml: &Yaml) -> Result<Box<Vec<String>>> {
+// impl TryFromYaml for Vec<String> {
+//     fn try_from_yaml(_builder: &ConfigBuilder, yaml: &Yaml) -> Result<Box<Vec<String>>> {
+//         let ret =
+//             yaml.as_vec()
+//                 .map(|f| f.to_owned())
+//                 .ok_or_else(|| ConfigError::ConvertionFailed {
+//                     value: format!("{:#?}", yaml),
+//                     expected_type: "Array".to_owned(),
+//                 })?;
+//         let mut ret_new = Vec::new();
+//         for elem in ret {
+//             let elem_res = elem.as_str().map(|e| e.to_owned()).ok_or_else(|| {
+//                 ConfigError::ConvertionFailed {
+//                     value: format!("{:#?}", elem),
+//                     expected_type: "String".to_owned(),
+//                 }
+//             })?;
+//             ret_new.push(elem_res);
+//         }
+//         Ok(Box::new(ret_new))
+//     }
+// }
+
+// impl TryFromYaml for Vec<MutationSiteID> {
+//     fn try_from_yaml(_builder: &ConfigBuilder, yaml: &Yaml) -> Result<Box<Vec<MutationSiteID>>> {
+//         let ret =
+//             yaml.as_vec()
+//                 .map(|f| f.to_owned())
+//                 .ok_or_else(|| ConfigError::ConvertionFailed {
+//                     value: format!("{:#?}", yaml),
+//                     expected_type: "Array".to_owned(),
+//                 })?;
+//         let mut ret_new = Vec::new();
+//         for elem in ret {
+//             let elem_res = elem
+//                 .as_i64()
+//                 .map(|e| MutationSiteID(e as u64))
+//                 .ok_or_else(|| ConfigError::ConvertionFailed {
+//                     value: format!("{:#?}", elem),
+//                     expected_type: "i64".to_owned(),
+//                 })?;
+//             ret_new.push(elem_res);
+//         }
+//         Ok(Box::new(ret_new))
+//     }
+// }
+
+impl TryFromYaml for MutationSiteID {
+    fn try_from_yaml(_builder: &ConfigBuilder, yaml: &Yaml) -> Result<Box<Self>> {
+        let ret = yaml.as_i64().map(|f| f.to_owned());
+        let ret = ret.ok_or_else(|| ConfigError::ConvertionFailed {
+            value: format!("{:#?}", yaml),
+            expected_type: "i64".to_owned(),
+        })?;
+        Ok(Box::new(MutationSiteID(ret as u64)))
+    }
+}
+
+impl<T: TryFromYaml> TryFromYaml for Vec<T> {
+    fn try_from_yaml(builder: &ConfigBuilder, yaml: &Yaml) -> Result<Box<Vec<T>>> {
         let ret =
             yaml.as_vec()
                 .map(|f| f.to_owned())
@@ -495,13 +712,8 @@ impl TryFromYaml for Vec<String> {
                 })?;
         let mut ret_new = Vec::new();
         for elem in ret {
-            let elem_res = elem.as_str().map(|e| e.to_owned()).ok_or_else(|| {
-                ConfigError::ConvertionFailed {
-                    value: format!("{:#?}", elem),
-                    expected_type: "String".to_owned(),
-                }
-            })?;
-            ret_new.push(elem_res);
+            let elem_res = T::try_from_yaml(builder, &elem)?;
+            ret_new.push(*elem_res);
         }
         Ok(Box::new(ret_new))
     }
@@ -558,6 +770,7 @@ for_int_type!(u8);
 for_int_type!(u16);
 for_int_type!(u32);
 for_int_type!(u64);
+for_int_type!(usize);
 
 for_int_type!(i8);
 for_int_type!(i16);
@@ -582,10 +795,42 @@ impl TryFromYaml for InputChannel {
             "none" => Ok(Box::new(InputChannel::None)),
             "stdin" => Ok(Box::new(InputChannel::Stdin)),
             "file" => Ok(Box::new(InputChannel::File)),
+            "tcp" => Ok(Box::new(InputChannel::Tcp)),
+            "udp" => Ok(Box::new(InputChannel::Udp)),
             _ => Err(ConfigError::InvalidValue(ret)),
         }
-        .context("Must be one of None, Stdin or File".to_owned())?;
+        .context("Must be one of None, Stdin, File or Network".to_owned())?;
         Ok(ret)
+    }
+}
+
+/// Try to convert a yaml string attribute value to a InputChannel enum variant.
+impl TryFromYaml for ServerReadySignalKind {
+    fn try_from_yaml(_builder: &ConfigBuilder, yaml: &Yaml) -> Result<Box<Self>> {
+        let ret = String::try_from_yaml(_builder, yaml)?;
+        let ret = ret.to_lowercase();
+
+        let r = Regex::new(r"(bind|listen)(\(([1-9]+[0-9]*)\))?").unwrap();
+        let matches = r.captures(&ret).unwrap();
+
+        if matches.get(3).is_none() {
+            let ret = match matches.get(1).unwrap().as_str() {
+                "bind" => Ok(Box::new(ServerReadySignalKind::Bind(0))),
+                "listen" => Ok(Box::new(ServerReadySignalKind::Listen(0))),
+                _ => Err(ConfigError::InvalidValue(ret)),
+            }
+            .context("Must be one of Bind or Listen".to_owned())?;
+            Ok(ret)
+        } else {
+            let ctr = matches.get(3).unwrap().as_str().parse().unwrap();
+            let ret = match matches.get(1).unwrap().as_str() {
+                "bind" => Ok(Box::new(ServerReadySignalKind::Bind(ctr))),
+                "listen" => Ok(Box::new(ServerReadySignalKind::Listen(ctr))),
+                _ => Err(ConfigError::InvalidValue(ret)),
+            }
+            .context("Must be one of Bind or Listen".to_owned())?;
+            Ok(ret)
+        }
     }
 }
 
@@ -598,9 +843,11 @@ impl TryFromYaml for OutputChannel {
             "none" => Ok(Box::new(OutputChannel::None)),
             "stdout" => Ok(Box::new(OutputChannel::Stdout)),
             "file" => Ok(Box::new(OutputChannel::File)),
+            "tcp" => Ok(Box::new(OutputChannel::Tcp)),
+            "udp" => Ok(Box::new(OutputChannel::Udp)),
             _ => Err(ConfigError::InvalidValue(ret)),
         }
-        .context("Must be one of None, Stdout or File".to_owned())?;
+        .context("Must be one of None, Stdout, File or Network".to_owned())?;
         Ok(ret)
     }
 }
@@ -684,6 +931,19 @@ impl TryFromYaml for yaml_rust::yaml::Hash {
     }
 }
 
+impl TryFromYaml for LLVMInstruction {
+    fn try_from_yaml(builder: &ConfigBuilder, yaml: &Yaml) -> Result<Box<Self>> {
+        let val = usize::try_from_yaml(builder, yaml)?;
+        let ret = LLVMInstruction::try_from(*val);
+        if let Ok(ret) = ret {
+            Ok(Box::new(ret))
+        } else {
+            let ret = ret.unwrap_err();
+            Err(ConfigError::InvalidValue(ret).into())
+        }
+    }
+}
+
 impl ConfigBuilder {
     /// Get an attribute from the given `yaml`.
     fn get_attribute<T: TryFromYaml + Debug>(&self, yaml: &Yaml, attr_name: &str) -> Result<T> {
@@ -699,7 +959,7 @@ impl ConfigBuilder {
         Ok(ret)
     }
 
-    #[allow(clippy::redundant_closure)]
+    #[allow(clippy::redundant_closure, unused)]
     fn get_section(&self, yml: &Yaml, name: &str) -> Result<Yaml> {
         let section: Option<yaml_rust::yaml::Hash> = self.get_attribute(yml, name)?;
         let section = section.map(|s| Yaml::Hash(s));
@@ -707,6 +967,17 @@ impl ConfigBuilder {
             Ok(section)
         } else {
             Err(ConfigError::MissingSection(name.to_owned()).into())
+        }
+    }
+
+    #[allow(clippy::redundant_closure)]
+    fn get_optional_section(&self, yml: &Yaml, name: &str) -> Result<Option<Yaml>> {
+        let section: Option<yaml_rust::yaml::Hash> = self.get_attribute(yml, name)?;
+        let section = section.map(|s| Yaml::Hash(s));
+        if let Some(section) = section {
+            Ok(Some(section))
+        } else {
+            Ok(None)
         }
     }
 
@@ -734,10 +1005,10 @@ impl ConfigBuilder {
     fn parse_general_section(&self, yaml: &mut Yaml) -> Result<GeneralConfig> {
         let work_dir = self.get_attribute(yaml, "work-directory")?;
         let input_dir = self.get_attribute(yaml, "input-directory")?;
-        let timeout: Option<Duration> = self.get_attribute(yaml, "timeout")?;
-        let timeout = timeout.unwrap_or_else(|| Duration::from_millis(40));
         let jail_uid = self.get_attribute(yaml, "jail-uid")?;
         let jail_gid = self.get_attribute(yaml, "jail-gid")?;
+        let jail_drop_to_sudo_callee: Option<bool> =
+            self.get_attribute(yaml, "jail-drop-to-sudo-callee")?;
 
         match (jail_uid, jail_gid) {
             (Some(..), Some(..)) => (),
@@ -750,13 +1021,15 @@ impl ConfigBuilder {
             &[
                 "work-directory",
                 "input-directory",
-                "timeout",
                 "jail-uid",
                 "jail-gid",
+                "jail-drop-to-sudo-callee",
                 "sink",
-                "afl++",
+                "sink-cov",
                 "source",
-                "symcc",
+                "afl-net",
+                "state-afl",
+                "sgfuzz",
                 "vanilla",
                 "phases",
             ],
@@ -765,11 +1038,10 @@ impl ConfigBuilder {
         Ok(GeneralConfig {
             work_dir,
             input_dir,
-            timeout,
-            tracing_timeout: Duration::from_secs(120),
-            purge_workdir: false,
+            tracing_timeout: Duration::from_secs(300),
             jail_uid,
             jail_gid,
+            jail_drop_to_sudo_callee: jail_drop_to_sudo_callee.unwrap_or(true),
         })
     }
 
@@ -783,6 +1055,14 @@ impl ConfigBuilder {
         let output_suffix = self.get_attribute(yaml, "output-suffix")?;
         let log_stdout = self.get_attribute(yaml, "log-stdout")?;
         let log_stderr = self.get_attribute(yaml, "log-stderr")?;
+        let is_server: Option<bool> = self.get_attribute(yaml, "is-server")?;
+        let server_port: Option<String> = self.get_attribute(yaml, "server-port")?;
+        let server_ready_on: Option<_> = self.get_attribute(yaml, "server-ready-on")?;
+        let allowed_patch_points = self.get_attribute(yaml, "allowed-patch-points")?;
+        let max_patch_points = self.get_attribute(yaml, "max-patch-points")?;
+        let blocked_patchpoint_instructions =
+            self.get_attribute(yaml, "blocked-patch-point-instructions")?;
+        let working_dir = self.get_attribute(yaml, "working-dir")?;
 
         ConfigBuilder::check_for_unparsed_keys(
             yaml,
@@ -795,6 +1075,13 @@ impl ConfigBuilder {
                 "output-suffix",
                 "log-stdout",
                 "log-stderr",
+                "is-server",
+                "server-port",
+                "server-ready-on",
+                "allowed-patch-points",
+                "max-patch-points",
+                "blocked-patch-point-instructions",
+                "working-dir",
             ],
         )?;
 
@@ -807,6 +1094,13 @@ impl ConfigBuilder {
             output_suffix,
             log_stdout,
             log_stderr,
+            is_server,
+            server_port,
+            server_ready_on,
+            allowed_patch_points,
+            max_patch_points,
+            blocked_patchpoint_instructions,
+            working_dir,
         })
     }
 
@@ -893,7 +1187,7 @@ impl ConfigBuilder {
         let weight: u32 = self.get_attribute(section, "weight")?;
         let entry_cov_timeout = self
             .get_attribute::<Option<Duration>>(section, "entry-cov-timeout")?
-            .unwrap_or_else(|| Duration::from_secs(60 * 10));
+            .unwrap_or_else(|| Duration::from_secs(60 * 30));
 
         ConfigBuilder::check_for_unparsed_keys(section, &["weight", "entry-cov-timeout"])?;
 
@@ -907,29 +1201,36 @@ impl ConfigBuilder {
         let generation_ceiling: Option<u32> =
             self.get_attribute(phases_section, "generation-ceiling")?;
 
-        let section = self.get_section(phases_section, "discovery")?;
-        let discovery_config = self
-            .parse_discovery_phase_section(&section)
-            .context("Failed to parse discovery section")
-            .unwrap_or_default();
+        let discovery_config =
+            if let Some(section) = self.get_optional_section(phases_section, "discovery")? {
+                self.parse_discovery_phase_section(&section)
+                    .context("Failed to parse discovery section")?
+            } else {
+                DiscoveryPhaseConfig::default()
+            };
 
-        let section = self.get_section(phases_section, "mutate")?;
-        let mutate_config = self
-            .parse_mutate_phase_section(&section)
-            .context("Failed to parse mutate section")
-            .unwrap_or_default();
+        let mutate_config =
+            if let Some(section) = self.get_optional_section(phases_section, "mutate")? {
+                self.parse_mutate_phase_section(&section)
+                    .context("Failed to parse mutate section")?
+            } else {
+                MutatePhaseConfig::default()
+            };
 
-        let section = self.get_section(phases_section, "add")?;
-        let add_config = self
-            .parse_add_phase_section(&section)
-            .context("Failed to parse add section")
-            .unwrap_or_default();
+        let add_config = if let Some(section) = self.get_optional_section(phases_section, "add")? {
+            self.parse_add_phase_section(&section)
+                .context("Failed to parse add section")?
+        } else {
+            AddPhaseConfig::default()
+        };
 
-        let section = self.get_section(phases_section, "combine")?;
-        let combine_config = self
-            .parse_combine_phase_section(&section)
-            .context("Failed to parse combine section")
-            .unwrap_or_default();
+        let combine_config =
+            if let Some(section) = self.get_optional_section(phases_section, "combine")? {
+                self.parse_combine_phase_section(&section)
+                    .context("Failed to parse combine section")?
+            } else {
+                CombinePhaseConfig::default()
+            };
 
         ConfigBuilder::check_for_unparsed_keys(
             phases_section,
@@ -951,12 +1252,102 @@ impl ConfigBuilder {
         })
     }
 
-    fn parse_afl_plus_section(&self, yaml: &Yaml) -> Result<AflPlusPlusConfig> {
+    fn parse_afl_net_section(&self, yaml: &Yaml) -> Result<AflNetConfig> {
+        let bin_path = self.get_attribute(yaml, "bin-path")?;
+        let env: Option<Vec<(String, String)>> = self.get_attribute(yaml, "env")?;
+        let env = env.unwrap_or_default();
         let input_dir = self.get_attribute(yaml, "input-dir")?;
+        let netinfo = self.get_attribute(yaml, "netinfo")?;
+        let protocol = self.get_attribute(yaml, "protocol")?;
+        let send_sigterm = self
+            .get_attribute::<Option<bool>>(yaml, "send-sigterm")?
+            .unwrap_or(false);
+        let enable_state_aware_mode = self
+            .get_attribute::<Option<bool>>(yaml, "enable-state-aware-mode")?
+            .unwrap_or(true);
 
-        ConfigBuilder::check_for_unparsed_keys(yaml, &["input-dir"])?;
+        ConfigBuilder::check_for_unparsed_keys(
+            yaml,
+            &[
+                "bin-path",
+                "env",
+                "input-dir",
+                "netinfo",
+                "protocol",
+                "send-sigterm",
+                "enable-state-aware-mode",
+            ],
+        )?;
 
-        Ok(AflPlusPlusConfig { input_dir })
+        Ok(AflNetConfig {
+            bin_path,
+            input_dir,
+            env,
+            netinfo,
+            protocol,
+            send_sigterm,
+            enable_state_aware_mode,
+        })
+    }
+
+    fn parse_state_afl_section(&self, yaml: &Yaml) -> Result<StateAflConfig> {
+        let bin_path = self.get_attribute(yaml, "bin-path")?;
+        let env: Option<Vec<(String, String)>> = self.get_attribute(yaml, "env")?;
+        let env = env.unwrap_or_default();
+        let input_dir = self.get_attribute(yaml, "input-dir")?;
+        let netinfo = self.get_attribute(yaml, "netinfo")?;
+        let protocol = self.get_attribute(yaml, "protocol")?;
+        let send_sigterm = self
+            .get_attribute::<Option<bool>>(yaml, "send-sigterm")?
+            .unwrap_or(false);
+        let enable_state_aware_mode = self
+            .get_attribute::<Option<bool>>(yaml, "enable-state-aware-mode")?
+            .unwrap_or(true);
+
+        ConfigBuilder::check_for_unparsed_keys(
+            yaml,
+            &[
+                "bin-path",
+                "env",
+                "input-dir",
+                "netinfo",
+                "protocol",
+                "send-sigterm",
+                "enable-state-aware-mode",
+            ],
+        )?;
+
+        Ok(StateAflConfig {
+            bin_path,
+            input_dir,
+            env,
+            netinfo,
+            protocol,
+            send_sigterm,
+            enable_state_aware_mode,
+        })
+    }
+
+    fn parse_sgfuzz_section(&self, yaml: &Yaml) -> Result<SGFuzzConfig> {
+        let bin_path = self.get_attribute(yaml, "bin-path")?;
+        let arguments = self.get_attribute(yaml, "arguments")?;
+        let env: Option<Vec<(String, String)>> = self.get_attribute(yaml, "env")?;
+        let env = env.unwrap_or_default();
+        let input_dir = self.get_attribute(yaml, "input-dir")?;
+        let netinfo = self.get_attribute(yaml, "netinfo")?;
+
+        ConfigBuilder::check_for_unparsed_keys(
+            yaml,
+            &["bin-path", "env", "input-dir", "netinfo", "arguments"],
+        )?;
+
+        Ok(SGFuzzConfig {
+            bin_path,
+            args: arguments,
+            input_dir,
+            env,
+            netinfo,
+        })
     }
 
     fn parse_sink_section(&self, yaml: &Yaml) -> Result<SinkConfig> {
@@ -968,21 +1359,36 @@ impl ConfigBuilder {
         let output_type = self.get_attribute(yaml, "output-type")?;
         let log_stdout = self.get_attribute(yaml, "log-stdout")?;
         let log_stderr = self.get_attribute(yaml, "log-stderr")?;
-        let allow_unstable_sink = self.get_attribute(yaml, "allow-unstable-sink")?;
+        let allow_unstable_sink: Option<bool> = self.get_attribute(yaml, "allow-unstable-sink")?;
+        let allow_unstable_sink = allow_unstable_sink.unwrap_or(true);
+        let is_server: Option<bool> = self.get_attribute(yaml, "is-server")?;
+        let server_port: Option<String> = self.get_attribute(yaml, "server-port")?;
+        let server_ready_on: Option<_> = self.get_attribute(yaml, "server-ready-on")?;
+        let working_dir = self.get_attribute(yaml, "working-dir")?;
+        let send_sigterm = self
+            .get_attribute::<Option<bool>>(yaml, "send-sigterm")?
+            .unwrap_or(false);
 
         ConfigBuilder::check_for_unparsed_keys(
             yaml,
             &[
                 "env",
                 "bin-path",
+                "bin-path-cov",
                 "arguments",
                 "input-type",
                 "output-type",
                 "log-stdout",
                 "log-stderr",
                 "allow-unstable-sink",
+                "is-server",
+                "server-port",
+                "server-ready-on",
+                "working-dir",
+                "send-sigterm",
             ],
-        )?;
+        )
+        .context("Sink")?;
 
         Ok(SinkConfig {
             bin_path,
@@ -993,27 +1399,26 @@ impl ConfigBuilder {
             log_stderr,
             env,
             allow_unstable_sink,
+            is_server,
+            server_port,
+            server_ready_on,
+            working_dir,
+            send_sigterm,
         })
     }
 
-    fn parse_symcc_section(&self, yaml: &Yaml) -> Result<SymccConfig> {
+    fn parse_sink_cov_section(&self, yaml: &Yaml) -> Result<SinkCovConfig> {
         let env: Option<Vec<_>> = self.get_attribute(yaml, "env")?;
         let env = env.unwrap_or_default();
         let bin_path = self.get_attribute(yaml, "bin-path")?;
-        let afl_bin_path = self.get_attribute(yaml, "afl-bin-path")?;
-        let afl_bin_env: Option<Vec<_>> = self.get_attribute(yaml, "afl-bin-env")?;
-        let afl_bin_env = afl_bin_env.unwrap_or_default();
+        let working_dir = self.get_attribute(yaml, "working-dir")?;
 
-        ConfigBuilder::check_for_unparsed_keys(
-            yaml,
-            &["env", "bin-path", "afl-bin-path", "afl-bin-env"],
-        )?;
+        ConfigBuilder::check_for_unparsed_keys(yaml, &["env", "bin-path", "working-dir"])?;
 
-        Ok(SymccConfig {
-            env,
+        Ok(SinkCovConfig {
             bin_path,
-            afl_bin_path,
-            afl_bin_env,
+            env,
+            working_dir,
         })
     }
 
@@ -1058,18 +1463,32 @@ impl ConfigBuilder {
         }
         let sink_config = self.parse_sink_section(sink_section)?;
 
-        let afl_plus_plus_section = &yaml["afl++"];
-        let afl_plus_plus_config = if afl_plus_plus_section.is_badvalue() {
+        let sink_cov_section = &yaml["sink-cov"];
+        let sink_cov_config = if sink_cov_section.is_badvalue() {
             None
         } else {
-            Some(self.parse_afl_plus_section(afl_plus_plus_section)?)
+            Some(self.parse_sink_cov_section(sink_cov_section)?)
         };
 
-        let symcc_section = &yaml["symcc"];
-        let symcc_section = if symcc_section.is_badvalue() {
+        let aflnet_section = &yaml["afl-net"];
+        let aflnet_section = if aflnet_section.is_badvalue() {
             None
         } else {
-            Some(self.parse_symcc_section(symcc_section)?)
+            Some(self.parse_afl_net_section(aflnet_section)?)
+        };
+
+        let stateafl_section = &yaml["state-afl"];
+        let stateafl_section = if stateafl_section.is_badvalue() {
+            None
+        } else {
+            Some(self.parse_state_afl_section(stateafl_section)?)
+        };
+
+        let sgfuzz_section = &yaml["sgfuzz"];
+        let sgfuzz_section = if sgfuzz_section.is_badvalue() {
+            None
+        } else {
+            Some(self.parse_sgfuzz_section(sgfuzz_section)?)
         };
 
         let vanilla_section = &yaml["vanilla"];
@@ -1084,8 +1503,10 @@ impl ConfigBuilder {
             source: source_config,
             phases: phase_config,
             sink: sink_config,
-            aflpp: afl_plus_plus_config,
-            symcc: symcc_section,
+            aflnet: aflnet_section,
+            stateafl: stateafl_section,
+            sgfuzz: sgfuzz_section,
+            sink_cov: sink_cov_config,
             vanilla: vanilla_config,
         };
         config.validate()?;

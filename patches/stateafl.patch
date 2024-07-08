@@ -1,0 +1,840 @@
+diff --git a/afl-fuzz.c b/afl-fuzz.c
+index 04d5fae..b68a9c3 100644
+--- a/afl-fuzz.c
++++ b/afl-fuzz.c
+@@ -4807,7 +4807,7 @@ static void pivot_inputs(void) {
+       u8* use_name = strstr(rsl, ",orig:");
+ 
+       if (use_name) use_name += 6; else use_name = rsl;
+-      nfn = alloc_printf("%s/queue/id:%06u,orig:%s", out_dir, id, use_name);
++      nfn = alloc_printf("%s/queue/id:%06u,ts:%lld,orig:%s", out_dir, id, get_cur_time() - start_time, use_name);
+ 
+ #else
+ 
+@@ -4953,8 +4953,8 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
+ 
+ #ifndef SIMPLE_FILES
+ 
+-    fn = alloc_printf("%s/queue/id:%06u,%s", out_dir, queued_paths,
+-                      describe_op(hnb));
++    fn = alloc_printf("%s/queue/id:%06u,ts:%lld,%s", out_dir, queued_paths,
++                      get_cur_time() - start_time, describe_op(hnb));
+ 
+ #else
+ 
+@@ -5051,8 +5051,8 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
+ 
+ #ifndef SIMPLE_FILES
+ 
+-      fn = alloc_printf("%s/replayable-hangs/id:%06llu,%s", out_dir,
+-                        unique_hangs, describe_op(0));
++      fn = alloc_printf("%s/replayable-hangs/id:%06llu,ts:%lld,%s", out_dir,
++                        unique_hangs, get_cur_time() - start_time, describe_op(0));
+ 
+ #else
+ 
+@@ -5095,8 +5095,8 @@ keep_as_crash:
+ 
+ #ifndef SIMPLE_FILES
+ 
+-      fn = alloc_printf("%s/replayable-crashes/id:%06llu,sig:%02u,%s", out_dir,
+-                        unique_crashes, kill_signal, describe_op(0));
++      fn = alloc_printf("%s/replayable-crashes/id:%06llu,ts:%lld,sig:%02u,%s", out_dir,
++                        unique_crashes, get_cur_time() - start_time, kill_signal, describe_op(0));
+ 
+ #else
+ 
+@@ -8907,6 +8907,8 @@ static void sync_fuzzers(char** argv) {
+   struct dirent* sd_ent;
+   u32 sync_cnt = 0;
+ 
++  return;
++
+   sd = opendir(sync_dir);
+   if (!sd) PFATAL("Unable to open '%s'", sync_dir);
+ 
+@@ -9845,8 +9847,8 @@ static void check_asan_opts(void) {
+     if (!strstr(x, "abort_on_error=1"))
+       FATAL("Custom ASAN_OPTIONS set without abort_on_error=1 - please fix!");
+ 
+-    if (!strstr(x, "symbolize=0"))
+-      FATAL("Custom ASAN_OPTIONS set without symbolize=0 - please fix!");
++    // if (!strstr(x, "symbolize=0"))
++    //   FATAL("Custom ASAN_OPTIONS set without symbolize=0 - please fix!");
+ 
+   }
+ 
+@@ -10420,6 +10422,7 @@ int main(int argc, char** argv) {
+ 
+   //if (!protocol_selected) FATAL("Please specify the protocol to be tested using the -P option");
+ 
++  start_time = get_cur_time();
+   setup_signal_handlers();
+   check_asan_opts();
+ 
+@@ -10495,8 +10498,6 @@ int main(int argc, char** argv) {
+ 
+   check_binary(argv[optind]);
+ 
+-  start_time = get_cur_time();
+-
+   if (qemu_mode)
+     use_argv = get_qemu_argv(argv[0], argv + optind, argc - optind);
+   else
+diff --git a/convert-pcap-replay-format.py b/convert-pcap-replay-format.py
+index 2e7968c..03aea53 100755
+--- a/convert-pcap-replay-format.py
++++ b/convert-pcap-replay-format.py
+@@ -59,10 +59,14 @@ total_messages = 0
+ request_msg = bytearray()
+ ports = {}
+ 
++first_seen_src_port = None
++
+ try:
+     with open(OUTPUT,"wb") as output:
+-
+-        for pkt in cap:
++        packages = list(cap)
++        if packages:
++            last_pkt = packages[-1]
++        for pkt in packages:
+ 
+             if 'TCP' or 'UDP' in pkt:
+ 
+@@ -85,13 +89,18 @@ try:
+                     print("Error: Multiple client/server flows detected")
+                     print("Please check that the PCAP file only contains traffic for only one client")
+                     sys.exit(1)
++                elif first_seen_src_port is not None and first_seen_src_port != srcport:
++                    print(f"src port {srcport} is different from the first seen flow's port {first_seen_src_port}, skipping")
++                    continue
+ 
+                 if (dstport == SERVER_PORT and
+                    (CLIENT_PORT is None or srcport == CLIENT_PORT)):
+                     if hasattr(pkt, 'data'):
++                        if first_seen_src_port is None:
++                            first_seen_src_port = srcport
+                         request_msg.extend(pkt.data.data.binary_value)
+ 
+-                if (('TCP' in pkt and dstport != SERVER_PORT) or
++                if last_pkt is pkt or (('TCP' in pkt and dstport != SERVER_PORT) or
+                    ('UDP' in pkt)) and len(request_msg) > 0:
+ 
+                     print(f'Writing {len(request_msg)} bytes...')
+@@ -111,4 +120,3 @@ if total_messages == 0:
+     sys.exit(1)
+ 
+ print(f"Converted PCAP saved to {OUTPUT}")
+-
+diff --git a/llvm_mode/Makefile b/llvm_mode/Makefile
+index 02512e2..904cc55 100644
+--- a/llvm_mode/Makefile
++++ b/llvm_mode/Makefile
+@@ -37,8 +37,8 @@ CXXFLAGS    += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
+                -DVERSION=\"$(VERSION)\" -Wno-variadic-macros
+ 
+ # Mark nodelete to work around unload bug in upstream LLVM 5.0+
+-CLANG_CFL    = `$(LLVM_CONFIG) --cxxflags` -Wl,-znodelete -fno-rtti -fpic $(CXXFLAGS)
+-CLANG_LFL    = `$(LLVM_CONFIG) --ldflags` $(LDFLAGS)
++CLANG_CFL    = `$(LLVM_CONFIG) --cxxflags` -Wl,-znodelete -fno-rtti -fpic #$(CXXFLAGS)
++CLANG_LFL    = `$(LLVM_CONFIG) --ldflags` #$(LDFLAGS)
+ 
+ # User teor2345 reports that this is required to make things work on MacOS X.
+ 
+@@ -90,19 +90,21 @@ endif
+ 
+ $(CONTAINERS):
+ 	cd Containers && \
+-	make static_clang && \
++	CFLAGS="-fsanitize=address -O0 -g" make -j1 static_clang && \
+ 	cp containers.a ..
+ 
+ $(MVPTREE):
+ 	cd mvptree && \
+-	make && \
++	make clean && \
++	CFLAGS="-fsanitize=address -O0 -g" make -j1 && \
+ 	cp libmvptree.a ..
+ 
+ $(TLSH):
+ 	cd tlsh && \
++	rm -rf build && \
+ 	mkdir -p build && \
+-	cd build && \
+-	cmake .. && \
++	cd  build && \
++	CFLAGS="-fsanitize=address -O0 -g -fPIC" CXXFLAGS="-O0 -g -fPIC" cmake .. && \
+ 	make && \
+ 	cp ../lib/libtlsh.a ../..
+ 
+diff --git a/llvm_mode/afl-clang-fast.c b/llvm_mode/afl-clang-fast.c
+index 4104ee1..7e43a54 100644
+--- a/llvm_mode/afl-clang-fast.c
++++ b/llvm_mode/afl-clang-fast.c
+@@ -130,11 +130,13 @@ static void edit_params(u32 argc, char** argv) {
+   cc_params[cc_par_cnt++] = "-fsanitize-coverage=trace-pc-guard";
+   cc_params[cc_par_cnt++] = "-mllvm";
+   cc_params[cc_par_cnt++] = "-sanitizer-coverage-block-threshold=0";
++  #error XXX
+ #else
+-  cc_params[cc_par_cnt++] = "-Xclang";
+-  cc_params[cc_par_cnt++] = "-load";
+-  cc_params[cc_par_cnt++] = "-Xclang";
+-  cc_params[cc_par_cnt++] = alloc_printf("%s/afl-llvm-pass.so", obj_path);
++  // cc_params[cc_par_cnt++] = "-Xclang";
++  // cc_params[cc_par_cnt++] = "-load";
++  // cc_params[cc_par_cnt++] = "-Xclang";
++  // cc_params[cc_par_cnt++] = alloc_printf("%s/afl-llvm-pass.so", obj_path);
++  cc_params[cc_par_cnt++]  = alloc_printf("-fpass-plugin=%s/afl-llvm-pass.so", obj_path);
+ #endif /* ^USE_TRACE_PC */
+ 
+   cc_params[cc_par_cnt++] = "-Qunused-arguments";
+@@ -163,7 +165,8 @@ static void edit_params(u32 argc, char** argv) {
+     if (!strcmp(cur, "-shared")) maybe_linking = 0;
+ 
+     if (!strcmp(cur, "-Wl,-z,defs") ||
+-        !strcmp(cur, "-Wl,--no-undefined")) continue;
++        !strcmp(cur, "-Wl,--no-undefined") ||
++        !strcmp(cur, "-Wl,-no-undefined")) continue;
+ 
+     cc_params[cc_par_cnt++] = cur;
+ 
+diff --git a/llvm_mode/afl-llvm-pass.so.cc b/llvm_mode/afl-llvm-pass.so.cc
+index e3d7878..a4129f2 100644
+--- a/llvm_mode/afl-llvm-pass.so.cc
++++ b/llvm_mode/afl-llvm-pass.so.cc
+@@ -29,6 +29,11 @@
+    in ../afl-as.h.
+ */
+ 
++#include <cassert>
++#include <cstdlib>
++#include <llvm/IR/DerivedTypes.h>
++#include <llvm/IR/Type.h>
++#include <llvm/Support/Casting.h>
+ #define AFL_LLVM_PASS
+ 
+ #include "../config.h"
+@@ -37,6 +42,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>
++#include <map>
+ 
+ #include "llvm/ADT/Statistic.h"
+ #include "llvm/ADT/SmallSet.h"
+@@ -44,7 +50,6 @@
+ #include "llvm/IR/LegacyPassManager.h"
+ #include "llvm/IR/Module.h"
+ #include "llvm/Support/Debug.h"
+-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+ 
+ #include "llvm/IR/DebugLoc.h"
+ #include "llvm/IR/DebugInfoMetadata.h"
+@@ -52,22 +57,27 @@
+ 
+ #include "llvm/IR/DataLayout.h"
+ 
++#include "llvm/Passes/PassPlugin.h"
++#include "llvm/Passes/PassBuilder.h"
++#include "llvm/IR/PassManager.h"
++
+ #include <cxxabi.h>
+ 
+ #include "state-tracer.h"
+ 
++constexpr std::nullopt_t None = std::nullopt;
++
+ using namespace llvm;
+ 
+ namespace {
+ 
+-  class AFLCoverage : public ModulePass {
++  class AFLCoverage : public PassInfoMixin<AFLCoverage> {
+ 
+     public:
+ 
+-      static char ID;
+-      AFLCoverage() : ModulePass(ID) { }
++      AFLCoverage() { }
+ 
+-      bool runOnModule(Module &M) override;
++      PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
+ 
+       // StringRef getPassName() const override {
+       //  return "American Fuzzy Lop Instrumentation";
+@@ -78,10 +88,7 @@ namespace {
+ }
+ 
+ 
+-char AFLCoverage::ID = 0;
+-
+-
+-bool AFLCoverage::runOnModule(Module &M) {
++PreservedAnalyses AFLCoverage::run(Module &M, ModuleAnalysisManager &MAM) {
+ 
+   LLVMContext &C = M.getContext();
+ 
+@@ -217,21 +224,20 @@ bool AFLCoverage::runOnModule(Module &M) {
+       ConstantInt *CurLoc = ConstantInt::get(Int32Ty, cur_loc);
+ 
+       /* Load prev_loc */
+-
+-      LoadInst *PrevLoc = IRB.CreateLoad(AFLPrevLoc);
++      LoadInst *PrevLoc = IRB.CreateLoad(IRB.getInt32Ty(), AFLPrevLoc);
+       PrevLoc->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+       Value *PrevLocCasted = IRB.CreateZExt(PrevLoc, IRB.getInt32Ty());
+ 
+       /* Load SHM pointer */
+ 
+-      LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr);
++      LoadInst *MapPtr = IRB.CreateLoad(PointerType::get(Int8Ty, 0), AFLMapPtr);
+       MapPtr->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+       Value *MapPtrIdx =
+-          IRB.CreateGEP(MapPtr, IRB.CreateXor(PrevLocCasted, CurLoc));
++          IRB.CreateGEP(Int8Ty, MapPtr, IRB.CreateXor(PrevLocCasted, CurLoc));
+ 
+       /* Update bitmap */
+ 
+-      LoadInst *Counter = IRB.CreateLoad(MapPtrIdx);
++      LoadInst *Counter = IRB.CreateLoad(Int8Ty, MapPtrIdx);
+       Counter->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+       Value *Incr = IRB.CreateAdd(Counter, ConstantInt::get(Int8Ty, 1));
+       IRB.CreateStore(Incr, MapPtrIdx)
+@@ -288,8 +294,7 @@ bool AFLCoverage::runOnModule(Module &M) {
+ 
+           stack_lookups.push_back(call_instr);
+         }
+-        else
+-        if ( called_func->getName() == "malloc" || demangled.find("operator new") != std::string::npos ) {
++        else if ( called_func->getName() == "malloc" || demangled.find("operator new") != std::string::npos ) {
+           OKF("Found function call: %s\n", called_func->getName().data());
+ 
+           if(demangled_status==0)
+@@ -298,13 +303,16 @@ bool AFLCoverage::runOnModule(Module &M) {
+           auto * voidTy = Type::getVoidTy(M.getContext());
+           auto * int8PtrTy = Type::getInt8PtrTy(M.getContext());
+           auto * int32Ty = Type::getInt32Ty(M.getContext());
++          auto * int64Ty = Type::getInt64Ty(M.getContext());
+ 
+-          auto * helperTy = FunctionType::get(voidTy, int8PtrTy, int32Ty);
++          auto * helperTy = FunctionType::get(voidTy, int8PtrTy, int64Ty);
+           auto helper_malloc = M.getOrInsertFunction("new_heap_alloc_record", helperTy);
+ 
+           IRBuilder<> builder(call_instr);
+           builder.SetInsertPoint(call_instr->getNextNode());
+-          builder.CreateCall(helper_malloc, {call_instr, call_instr->getOperand(0)});
++
++          auto *size = builder.CreateIntCast(call_instr->getOperand(0), int64Ty, false);
++          builder.CreateCall(helper_malloc, {call_instr, size});
+ 
+         }
+         if ( called_func->getName() == "calloc" ) {
+@@ -319,7 +327,10 @@ bool AFLCoverage::runOnModule(Module &M) {
+ 
+           IRBuilder<> builder(call_instr);
+           builder.SetInsertPoint(call_instr->getNextNode());
+-          builder.CreateCall(helper_malloc, {call_instr, call_instr->getOperand(1), call_instr->getOperand(0)});
++
++          auto *num = builder.CreateIntCast(call_instr->getOperand(0), int32Ty, false);
++          auto *size = builder.CreateIntCast(call_instr->getOperand(1), int32Ty, false);
++          builder.CreateCall(helper_malloc, {call_instr, size, num});
+ 
+         }
+         if ( called_func->getName() == "realloc" ) {
+@@ -334,7 +345,9 @@ bool AFLCoverage::runOnModule(Module &M) {
+ 
+           IRBuilder<> builder(call_instr);
+           builder.SetInsertPoint(call_instr->getNextNode());
+-          builder.CreateCall(helper_malloc, {call_instr, call_instr->getOperand(1), call_instr->getOperand(0)});
++
++          auto *size = builder.CreateIntCast(call_instr->getOperand(1), int32Ty, false);
++          builder.CreateCall(helper_malloc, {call_instr, size, call_instr->getOperand(0)});
+ 
+         }
+         else if ( called_func->getName() == "free" || demangled.find("operator delete") != std::string::npos ) {
+@@ -366,7 +379,9 @@ bool AFLCoverage::runOnModule(Module &M) {
+           auto helper = M.getOrInsertFunction("trace_receive", helperTy);
+ 
+           IRBuilder<> builder(call_instr);
+-          builder.CreateCall(helper, {call_instr->getOperand(1), call_instr->getOperand(2)});
++
++          auto *size = builder.CreateIntCast(call_instr->getOperand(2), int32Ty, false);
++          builder.CreateCall(helper, {call_instr->getOperand(1), size});
+ 
+         }
+         else if( called_func->getName() == "recvmsg" )
+@@ -380,26 +395,37 @@ bool AFLCoverage::runOnModule(Module &M) {
+           auto * helperTy = FunctionType::get(voidTy, int8PtrTy, int32Ty);
+           auto helper = M.getOrInsertFunction("trace_receive", helperTy);
+ 
+-          Value * buf_size;
+-          int struct_size;
+-          Type * T = call_instr->getOperand(1)->getType();
++          // Value * buf_size;
++          // int struct_size;
++          // Type * T = call_instr->getOperand(1)->getType();
+ 
+-          if( !T->isPointerTy() || !T->getContainedType(0)->isStructTy() ) {
++          // call_instr->dump();
++          // T->dump();
+ 
+-            WARNF("Error in recvmsg(): non-pointer input parameter\n");
+-            continue;
+-          }
++          // if( !T->isPointerTy() || !T->getContainedType(0)->isStructTy() ) {
+ 
+-          Type * PT = T->getContainedType(0);
+-          llvm::DataLayout* dl = new llvm::DataLayout(&M);
+-          struct_size = dl->getTypeAllocSize(PT);
++          //   WARNF("Error in recvmsg(): non-pointer input parameter\n");
++          //   continue;
++          // }
++
++          // Type * PT = T->getContainedType(0);
++          // llvm::DataLayout* dl = new llvm::DataLayout(&M);
++          // struct_size = dl->getTypeAllocSize(PT);
+ 
+           //WARNF("Type %s size: %d\n", PT->getStructName().data(), struct_size);
+ 
+-          buf_size = llvm::ConstantInt::get(int32Ty, struct_size, true);
++          // struct size
++          // #include <stdio.h>
++          // #include <sys/types.h>
++          // #include <sys/socket.h>
++
++          // int main() {
++          //         printf("%u", sizeof(struct msghdr));
++          // }
++          Value * msg_hdr_struct_size = llvm::ConstantInt::get(int32Ty, 56, true);
+ 
+           IRBuilder<> builder(call_instr);
+-          builder.CreateCall(helper, {call_instr->getOperand(1), buf_size});
++          builder.CreateCall(helper, {call_instr->getOperand(1), msg_hdr_struct_size});
+ 
+         }
+         else if(  called_func->getName() == "send" 
+@@ -415,7 +441,9 @@ bool AFLCoverage::runOnModule(Module &M) {
+           auto helper = M.getOrInsertFunction("trace_send", helperTy);
+ 
+           IRBuilder<> builder(call_instr);
+-          builder.CreateCall(helper, {call_instr->getOperand(1), call_instr->getOperand(2)});
++
++          auto *size = builder.CreateIntCast(call_instr->getOperand(2), int32Ty, false);
++          builder.CreateCall(helper, {call_instr->getOperand(1), size});
+ 
+         }
+         else if(  called_func->getName() == "sendmsg" )
+@@ -429,32 +457,43 @@ bool AFLCoverage::runOnModule(Module &M) {
+           auto * helperTy = FunctionType::get(voidTy, int8PtrTy, int32Ty);
+           auto helper = M.getOrInsertFunction("trace_send", helperTy);
+ 
+-          Value * buf_size;
+-          int struct_size;
+-          Type * T = call_instr->getOperand(1)->getType();
++          //Value * buf_size;
++          //int struct_size;
++          //Type * T = call_instr->getOperand(1)->getType();
++          // call_instr->dump();
++          // T->dump();
+ 
+-          if( !T->isPointerTy() || !T->getContainedType(0)->isStructTy() ) {
++          // if( !T->isPointerTy() || !T->getContainedType(0)->isStructTy() ) {
+ 
+-            WARNF("Error in sendmsg(): non-pointer input parameter\n");
+-            continue;
+-          }
++          //   WARNF("Error in sendmsg(): non-pointer input parameter\n");
++          //   continue;
++          // }
+ 
+-          Type * PT = T->getContainedType(0);
+-          llvm::DataLayout* dl = new llvm::DataLayout(&M);
+-          struct_size = dl->getTypeAllocSize(PT);
++          // Type * PT = T->getContainedType(0);
++          // llvm::DataLayout* dl = new llvm::DataLayout(&M);
++          // struct_size = dl->getTypeAllocSize(PT);
+ 
+-          //WARNF("Type %s size: %d\n", PT->getStructName().data(), struct_size);
++          // //WARNF("Type %s size: %d\n", PT->getStructName().data(), struct_size);
++
++          // struct size
++          // #include <stdio.h>
++          // #include <sys/types.h>
++          // #include <sys/socket.h>
+ 
+-          buf_size = llvm::ConstantInt::get(int32Ty, struct_size, true);
++          // int main() {
++          //         printf("%u", sizeof(struct msghdr));
++          // }
++          Value * msg_hdr_struct_size = llvm::ConstantInt::get(int32Ty, 56, true);
+ 
+           IRBuilder<> builder(call_instr);
+-          builder.CreateCall(helper, {call_instr->getOperand(1), buf_size});
++          builder.CreateCall(helper, {call_instr->getOperand(1), msg_hdr_struct_size});
+ 
+         }
+-        else if(   map_custom_receive.count(called_func->getName().data()) 
++        else if(   map_custom_receive.count(called_func->getName().data())
+                 || map_custom_send.count(called_func->getName()) )
+         {
+           OKF("Found function call: %s\n", called_func->getName().data());
++          assert(false && "Unsupported");
+ 
+           auto * voidTy = Type::getVoidTy(M.getContext());
+           auto * int8PtrTy = Type::getInt8PtrTy(M.getContext()); /* pass buffer address */
+@@ -490,13 +529,13 @@ bool AFLCoverage::runOnModule(Module &M) {
+ 
+           if(param_pos != -1) {
+ 
+-			auto arg = called_func->arg_begin();
+-			int arg_no = 0;
++            auto arg = called_func->arg_begin();
++            int arg_no = 0;
+ 
+-			while(arg != called_func->arg_end() && arg_no < param_pos) {
+-			  arg++;
+-			  arg_no++;
+-			}
++            while(arg != called_func->arg_end() && arg_no < param_pos) {
++              arg++;
++              arg_no++;
++            }
+ 
+ 
+             Type * T = arg->getType();
+@@ -554,11 +593,26 @@ bool AFLCoverage::runOnModule(Module &M) {
+           auto helper_read = M.getOrInsertFunction("trace_read", helperTy);
+ 
+           /* Note: Operand 2 (size_t) is 64 bit wide */
+-          std::vector<Value *> call_args = {call_instr->getOperand(0), call_instr->getOperand(1), call_instr->getOperand(2)};
+-          
++
+           IRBuilder<> builder(call_instr);
++          auto *len = builder.CreateIntCast(call_instr->getOperand(2), int32Ty, false);
++          std::vector<Value *> call_args = {call_instr->getOperand(0), call_instr->getOperand(1), len};
++
+           builder.CreateCall(helper_read, call_args);
++        }
++        else if( called_func->getName() == "readv" ) {
++          OKF("Found function call: %s\n", called_func->getName().data());
++
++          auto * voidTy = Type::getVoidTy(M.getContext());
++          auto * int32Ty = Type::getInt32Ty(M.getContext());
++          auto * int8PtrTy = Type::getInt8PtrTy(M.getContext()); /* pass buffer address */
++
++          auto * helperTy = FunctionType::get(voidTy, {int32Ty, int8PtrTy, int32Ty}, false);
++          auto helper_read = M.getOrInsertFunction("trace_readv", helperTy);
+ 
++          IRBuilder<> builder(call_instr);
++          std::vector<Value *> call_args = {call_instr->getOperand(0), call_instr->getOperand(1), call_instr->getOperand(2)};
++          builder.CreateCall(helper_read, call_args);
+         }
+         else if( called_func->getName() == "write" ) {
+           OKF("Found function call: %s\n", called_func->getName().data());
+@@ -570,14 +624,38 @@ bool AFLCoverage::runOnModule(Module &M) {
+           auto * helperTy = FunctionType::get(voidTy, {int32Ty, int8PtrTy, int32Ty}, false);
+           auto helper_write = M.getOrInsertFunction("trace_write", helperTy);
+ 
+-          std::vector<Value *> call_args = {call_instr->getOperand(0), call_instr->getOperand(1), call_instr->getOperand(2)};
+ 
+           IRBuilder<> builder(call_instr);
++          auto *size = builder.CreateIntCast(call_instr->getOperand(2), int32Ty, false);
++          std::vector<Value *> call_args = {call_instr->getOperand(0), call_instr->getOperand(1), size};
++
+           builder.CreateCall(helper_write, call_args);
++        }
++        else if( called_func->getName() == "writev" ) {
++          if (getenv("FT_SKIP_WRITEV")) {
++            continue;
++          }
++          OKF("Found function call: %s\n", called_func->getName().data());
++
++          auto * voidTy = Type::getVoidTy(M.getContext());
++          auto * int32Ty = Type::getInt32Ty(M.getContext());
++          auto * int8PtrTy = Type::getInt8PtrTy(M.getContext()); /* pass buffer address */
++
++          auto * helperTy = FunctionType::get(voidTy, {int32Ty, int8PtrTy, int32Ty}, false);
++          auto helper_write = M.getOrInsertFunction("trace_writev", helperTy);
++
++          IRBuilder<> builder(call_instr);
++          std::vector<Value *> call_args = {call_instr->getOperand(0), call_instr->getOperand(1), call_instr->getOperand(2)};
+ 
++          builder.CreateCall(helper_write, call_args);
+         }
+         else if( called_func->getName() == "fprintf" ) {
+           OKF("Found function call: %s\n", called_func->getName().data());
++#if 1
++          // taking the return value of fprintf and using this as bound for the format
++          // string buffer does not make any sense.
++          continue;
++#endif
+ 
+           auto * voidTy = Type::getVoidTy(M.getContext());
+           auto * int8PtrTy = Type::getInt8PtrTy(M.getContext());
+@@ -586,10 +664,12 @@ bool AFLCoverage::runOnModule(Module &M) {
+           auto * helperTy = FunctionType::get(voidTy, { int8PtrTy, int8PtrTy, int32Ty }, false);
+           auto helper = M.getOrInsertFunction("trace_fprintf", helperTy);
+ 
+-          std::vector<Value *> call_args = {call_instr->getOperand(0), call_instr->getOperand(1), call_instr};
+ 
+           IRBuilder<> builder(call_instr);
+           builder.SetInsertPoint(call_instr->getNextNode());
++          auto *size = builder.CreateIntCast(call_instr, int32Ty, false);
++
++          std::vector<Value *> call_args = {call_instr->getOperand(0), call_instr->getOperand(1), size};
+           builder.CreateCall(helper, call_args);
+ 
+         }
+@@ -620,10 +700,13 @@ bool AFLCoverage::runOnModule(Module &M) {
+           auto * helperTy = FunctionType::get(voidTy, { int8PtrTy, int8PtrTy, int32Ty, int32Ty }, false);
+           auto helper = M.getOrInsertFunction("trace_fwrite", helperTy);
+ 
+-          std::vector<Value *> call_args = {call_instr->getOperand(3), call_instr->getOperand(0), call_instr->getOperand(1), call_instr->getOperand(2)};
+ 
+           IRBuilder<> builder(call_instr);
+           //builder.SetInsertPoint(call_instr->getNextNode());
++          auto *size = builder.CreateIntCast(call_instr->getOperand(1), int32Ty, false);
++          auto *ntimes = builder.CreateIntCast(call_instr->getOperand(2), int32Ty, false);
++          std::vector<Value *> call_args = {call_instr->getOperand(3), call_instr->getOperand(0), size, ntimes};
++
+           builder.CreateCall(helper, call_args);
+ 
+         }
+@@ -637,10 +720,13 @@ bool AFLCoverage::runOnModule(Module &M) {
+           auto * helperTy = FunctionType::get(voidTy, { int8PtrTy, int8PtrTy, int32Ty, int32Ty }, false);
+           auto helper = M.getOrInsertFunction("trace_fread", helperTy);
+ 
+-          std::vector<Value *> call_args = {call_instr->getOperand(3), call_instr->getOperand(0), call_instr->getOperand(1), call_instr->getOperand(2)};
+ 
+           IRBuilder<> builder(call_instr);
+           //builder.SetInsertPoint(call_instr->getNextNode());
++          auto *size = builder.CreateIntCast(call_instr->getOperand(1), int32Ty, false);
++          auto *ntimes = builder.CreateIntCast(call_instr->getOperand(2), int32Ty, false);
++
++          std::vector<Value *> call_args = {call_instr->getOperand(3), call_instr->getOperand(0), size, ntimes};
+           builder.CreateCall(helper, call_args);
+ 
+         }
+@@ -706,6 +792,8 @@ bool AFLCoverage::runOnModule(Module &M) {
+       IRBuilder<> builder(call_instr);
+ 
+       // test if allocated stack size is greater or equal than threshold
++      // call_instr->dump();
++      // call_instr->getOperand(0)->dump();
+       auto stack_size_cmp = builder.CreateICmpUGE(call_instr->getOperand(0), ConstantInt::get(int64Ty, MIN_STACK_ALLOC_SIZE));
+       auto split_before = SplitBlockAndInsertIfThen(stack_size_cmp, call_instr, false);
+       builder.SetInsertPoint(split_before);
+@@ -736,21 +824,51 @@ bool AFLCoverage::runOnModule(Module &M) {
+ 
+   }
+ 
+-  return true;
++  return PreservedAnalyses::none();
+ 
+ }
+ 
++                 /* use new pass manager */
++extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
++llvmGetPassPluginInfo() {
+ 
+-static void registerAFLPass(const PassManagerBuilder &,
+-                            legacy::PassManagerBase &PM) {
++  return {LLVM_PLUGIN_API_VERSION, "AFLCoverage", "v0.1",
++          /* lambda to insert our pass into the pass pipeline. */
++          [](PassBuilder &PB) {
+ 
+-  PM.add(new AFLCoverage());
++  #if 1
++    #if LLVM_VERSION_MAJOR <= 13
++            using OptimizationLevel = typename PassBuilder::OptimizationLevel;
++    #endif
++            PB.registerOptimizerLastEPCallback(
++                [](ModulePassManager &MPM, OptimizationLevel OL) {
+ 
+-}
++                  MPM.addPass(AFLCoverage());
++
++                });
++
++  /* TODO LTO registration */
++  #else
++            using PipelineElement = typename PassBuilder::PipelineElement;
++            PB.registerPipelineParsingCallback([](StringRef          Name,
++                                                  ModulePassManager &MPM,
++                                                  ArrayRef<PipelineElement>) {
++
++              if (Name == "AFLCoverage") {
++
++                MPM.addPass(AFLCoverage());
++                return true;
++
++              } else {
++
++                return false;
++
++              }
++
++            });
+ 
++  #endif
+ 
+-static RegisterStandardPasses RegisterAFLPass(
+-    PassManagerBuilder::EP_ModuleOptimizerEarly, registerAFLPass);
++          }};
+ 
+-static RegisterStandardPasses RegisterAFLPass0(
+-    PassManagerBuilder::EP_EnabledOnOptLevel0, registerAFLPass);
++}
+\ No newline at end of file
+diff --git a/llvm_mode/afl-llvm-rt-state-tracer.o.c b/llvm_mode/afl-llvm-rt-state-tracer.o.c
+index 65290a9..4b56f2a 100644
+--- a/llvm_mode/afl-llvm-rt-state-tracer.o.c
++++ b/llvm_mode/afl-llvm-rt-state-tracer.o.c
+@@ -1,3 +1,4 @@
++#include <bits/types/struct_iovec.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <signal.h>
+@@ -202,18 +203,27 @@ static int compare_int(const void *const one, const void *const two) {
+ }
+ 
+ 
+-static Tlsh * __dist_t1;
+-static Tlsh * __dist_t2;
+-
+ static float tlsh_distance(MVPDP *pointA, MVPDP *pointB){
++    float diff = 0.0;
++    Tlsh * __dist_t1;
++    Tlsh * __dist_t2;
++
++    __dist_t1 = Tlsh_new();
++    __dist_t2 = Tlsh_new();
++
++    // Tlsh_from_str(__dist_t1, "xxx");
++    // Tlsh_from_str(__dist_t2, "yyy");
+ 
+     Tlsh_from_str(__dist_t1, pointA->data);
+     Tlsh_from_str(__dist_t2, pointB->data);
+ 
+-    int diff = Tlsh_total_diff(__dist_t1, __dist_t2, 1/*len_diff*/);
++    //int diff = Tlsh_total_diff(__dist_t1, __dist_t2, 1/*len_diff*/);
+ 
+     LOG_DEBUG("TLSH DISTANCE: %d\n", diff);
+ 
++    Tlsh_delete(__dist_t1);
++    Tlsh_delete(__dist_t2);
++
+     return (float)diff;
+ }
+ 
+@@ -382,7 +392,7 @@ void init_state_tracer() {
+     // For testing
+     state_shared_ptr = malloc(sizeof(struct state_shared));
+ 
+-    LOG_DEBUG("NO SHM (for testing)\n");
++    LOG_DEBUG("NO state_shared_ptr (for testing)\n");
+   }
+ 
+ 
+@@ -577,8 +587,7 @@ next_item_global:
+     mvp_radius_default = atoi(mvp_str);
+   }
+ 
+-
+-  if(getenv("AFL_USE_ASAN") || getenv("ASAN_OPTIONS")) {
++  if(1 || getenv("AFL_USE_ASAN") || getenv("ASAN_OPTIONS")) {
+ 
+     LOG_DEBUG("ASAN DETECTED\n");
+ 
+@@ -985,6 +994,7 @@ static void tracer_dump() {
+ 
+ 
+   void ** key = map_first(alloc_records_map);
++  int null_fd = open("/dev/null", O_WRONLY);
+ 
+   while( key != NULL ) {
+ 
+@@ -1001,7 +1011,12 @@ static void tracer_dump() {
+       dump.record = record;
+       dump.contents = malloc(record->size);
+       dump.size = record->size;
+-      memcpy(dump.contents, record->addr, record->size);
++
++      if (null_fd > 0) {
++        if (write(null_fd, record->addr, record->size) != -1) {
++          memcpy(dump.contents, record->addr, record->size);
++        }
++      }
+ 
+       queue_push(alloc_dumps_queue, &dump);
+ 
+@@ -1161,6 +1176,19 @@ void trace_read(int fd, void * buf, int size) {
+   END_TIMING("read");
+ }
+ 
++void trace_readv(int fd, const struct iovec *iov, int iovcnt) {
++  LOG_DEBUG("TRACE READV\n");
++
++  if (is_socket(fd)) {
++    for (int i = 0; i < iovcnt; i++) {
++      const struct iovec *iovec = &iov[i];
++      net_receive(iovec->iov_base, iovec->iov_len);
++    }
++  }
++
++}
++
++
+ void trace_write(int fd, void * buf, int size) {
+ 
+   LOG_DEBUG("TRACE WRITE\n");
+@@ -1174,6 +1202,18 @@ void trace_write(int fd, void * buf, int size) {
+   END_TIMING("write");
+ }
+ 
++void trace_writev(int fd, const struct iovec *iov, int iovcnt) {
++  LOG_DEBUG("TRACE WRITEV\n");
++
++  if (is_socket(fd)) {
++    for (int i = 0; i < iovcnt; i++) {
++      const struct iovec *iovec = &iov[i];
++      net_send(iovec->iov_base, iovec->iov_len);
++    }
++  }
++
++}
++
+ void trace_fprintf(void* p, void * buf, int size) {
+ 
+   LOG_DEBUG("TRACE FPRINTF\n");
+@@ -1352,7 +1392,7 @@ unsigned int compute_state_value(Tlsh * t, int data_size, MVPTree * tree, unsign
+ 
+         Tlsh_from_str(ref_tlsh, calib_shm->ref_state_seq[current_state_number]);
+ 
+-        int diff = Tlsh_total_diff(ref_tlsh, t, 1/*len_diff*/);
++        int diff = 1; //Tlsh_total_diff(ref_tlsh, t, 1/*len_diff*/);
+ 
+         LOG_DEBUG("TLSH DISTANCE FROM REF: %d\n", diff);
+ 
+@@ -1580,9 +1620,6 @@ void end_state_tracer() {
+   Tlsh * tlsh = Tlsh_new();
+   int curr_state_buffer_data = 0;
+ 
+-  __dist_t1 = Tlsh_new();
+-  __dist_t2 = Tlsh_new();
+-
+ 
+ 
+   for(int i=0; i<num_dumps; i++) {
+@@ -1870,9 +1907,6 @@ void end_state_tracer() {
+   free(tree);
+ 
+   Tlsh_delete(tlsh);
+-  Tlsh_delete(__dist_t1);
+-  Tlsh_delete(__dist_t2);
+-
+ 
+ end_analysis:
+ 

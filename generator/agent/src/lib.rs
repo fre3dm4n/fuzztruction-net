@@ -5,8 +5,6 @@
 #![feature(allocator_api)]
 
 extern crate memoffset;
-pub use fuzztruction_shared::communication_channel;
-pub use fuzztruction_shared::messages;
 pub mod agent;
 pub mod mem;
 pub mod tracing;

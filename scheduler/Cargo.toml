@@ -5,27 +5,17 @@ authors = ["nbars <nils.bars@rub.de>", "mschloegel <moritz.schloegel@rub.de>"]
 edition = "2021"
 default-run = "fuzztruction"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[[bin]]
-name = "benchmark_sink"
-path = "src/cli/benchmark_sink.rs"
-
 [[bin]]
 name = "fuzztruction"
 path = "src/cli/fuzztruction.rs"
 
-[features]
-#default = ["introspection"]
-introspection = []
-
 [dependencies]
 elf = "~0"
 gimli = "~0"
-keystone = { git = "https://github.com/keystone-engine/keystone" }
+keystone = { git = "https://github.com/keystone-engine/keystone", tag = "0.9.2" }
 posixmq = "~0"
 rand = "~0"
-nix = "~0"
+nix = { version = "~0", features = ["user", "signal", "fs", "resource"] }
 proc-maps = "~0"
 shared_memory = {git = "https://github.com/elast0ny/shared_memory-rs", rev = "4879c7641f64d444420b81fd32f496939ee7155d", package = "shared_memory"}
 mktemp = "~0"
@@ -45,7 +35,7 @@ anyhow = "~1"
 thiserror = "~1"
 yaml-rust = "0.4.5"
 clap = { version = "3.0.0-beta.2" }
-log = { version = "~0", features = ["kv_unstable"] }
+log = { workspace = true }
 fern = { version = "~0", features = ["colored"] }
 simple_logger = "~1"
 core_affinity = "0.5.10"
@@ -65,4 +55,17 @@ itertools = "~0"
 glob = "0.3.0"
 flate2 = "1.0.22"
 fs_extra = "1.2.0"
-llvm_stackmap =  {version = "0.1.4", features = ["serde"] }
+llvm_stackmap = { workspace = true }
+hexdump = "0.1.1"
+tqdm = "0.6.0"
+indicatif = "0.17.7"
+llvm-cov-json = {version = "~0" }
+pcap = "1.1.0"
+console = "0.15.8"
+sha256 = "1.5.0"
+wait-timeout = "0.2.0"
+bytes = "1.5.0"
+pcap-parser = "0.15.0"
+file-rotate = "0.7.5"
+sysinfo = "0.30.10"
+bitreader = "0.3.8"

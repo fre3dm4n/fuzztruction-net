@@ -7,7 +7,8 @@ use std::{
     io::Write,
     mem,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock}, process::exit
+    process::exit,
+    sync::{Arc, RwLock},
 };
 
 use rand::seq::SliceRandom;

@@ -50,7 +50,10 @@ impl CommunicationChannel {
 
         for e in [&mq_send, &mq_recv].iter() {
             match e {
-                Err(_) => return Err(CommunicationChannelError::FailedToOpenMessageQueues),
+                Err(_) => {
+                    eprintln!("Failed to open queue: {e:#?}");
+                    return Err(CommunicationChannelError::FailedToOpenMessageQueues);
+                }
                 _ => (),
             };
         }
@@ -109,9 +112,6 @@ impl CommunicationChannel {
             .or_else(|e| Err(CommunicationChannelError::MalformedMessage(e)))?;
 
         // The header is valid. Lets try to convert the bytes into a concrete message.
-
-        //trace!("Received message of type: {:?}", header.id);
-
         match header.id {
             MessageType::MsgIdHello => {
                 return Ok(ReceivableMessages::HelloMessage(

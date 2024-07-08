@@ -8,6 +8,7 @@ use std::{
         Arc, Barrier, Mutex, Once, RwLock,
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 use crate::{
@@ -19,7 +20,7 @@ use crate::{
 
 use anyhow::{anyhow, Result};
 
-use fuzztruction_shared::types::PatchPointID;
+use fuzztruction_shared::types::MutationSiteID;
 use lazy_static::lazy_static;
 use libc::CPU_SET;
 use regex::Regex;
@@ -61,9 +62,10 @@ pub struct FuzzerState {
     /// The current [FuzzingPhase].
     phase: Option<FuzzingPhase>,
     /// The currently fuzzed [PatchPointID]
-    patch_point: Option<PatchPointID>,
+    patch_point: Option<MutationSiteID>,
     /// The currently used [MutatorType].
     mutator: Option<MutatorType>,
+    last_mutator: Option<MutatorType>,
     /// Total iterations of the current mutator.
     mutator_total_iterations: Option<usize>,
     /// Number of iterations done so far for the current mutator.
@@ -90,11 +92,14 @@ impl FuzzerState {
         self.phase = Some(phase);
     }
 
-    pub fn set_patch_point(&mut self, patch_point: PatchPointID) {
+    pub fn set_patch_point(&mut self, patch_point: MutationSiteID) {
         self.patch_point = Some(patch_point);
     }
 
     pub fn set_mutator(&mut self, mutator: MutatorType, total_iterations: usize) {
+        if let Some(last_mutator) = self.mutator {
+            self.last_mutator.replace(last_mutator);
+        }
         self.mutator = Some(mutator);
         self.mutator_total_iterations = Some(total_iterations);
     }
@@ -120,12 +125,16 @@ impl FuzzerState {
         self.phase.unwrap()
     }
 
-    pub fn patch_point(&self) -> PatchPointID {
+    pub fn patch_point(&self) -> MutationSiteID {
         self.patch_point.unwrap()
     }
 
     pub fn mutator(&self) -> MutatorType {
         self.mutator.unwrap()
+    }
+
+    pub fn last_mutator(&self) -> Option<MutatorType> {
+        self.last_mutator
     }
 
     pub fn _mutator_total_iterations(&self) -> usize {
@@ -175,6 +184,8 @@ pub struct FuzzingWorker {
     pub interesting_inputs: PathBuf,
     /// Path to the directory in which inputs that caused crashes are stored.
     pub crashing_inputs: PathBuf,
+    /// Path to the directory that containts ASAN reports for crashing inputs.
+    pub asan_reports: PathBuf,
     /// Shared coverage map used to deduplicate crashes.
     pub shared_crash_virgin_map: Arc<Mutex<Bitmap>>,
     /// A local cache that is queried to avoid locking `shared_crash_virgin_map`
@@ -187,6 +198,7 @@ pub struct FuzzingWorker {
     /// Barrier used to block initialized threads until all other threads have
     /// been initialized.
     pub init_shared_barrier: Arc<Barrier>,
+    pub start_ts: Instant,
 }
 
 /// Counter used to allocate unique IDs for each new worker.
@@ -301,10 +313,10 @@ impl FuzzingWorker {
 
         let uid = WorkerUid(NEXT_WORKER_UID.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
         let config = config.clone();
-        let cfg_timeout = config.general.timeout;
 
         let interesting_inputs = config.general.interesting_path();
         let crashing_inputs = config.general.crashing_path();
+        let asan_reports = config.general.asan_reports_path();
 
         FuzzingWorker {
             uid,
@@ -323,28 +335,38 @@ impl FuzzingWorker {
             sink: None,
             interesting_inputs,
             crashing_inputs,
+            asan_reports,
             crash_virgin_map,
             shared_crash_virgin_map,
             stop_requested: false,
             state: Default::default(),
-            avg_execution_duration: cfg_timeout.div_f32(2f32),
+            avg_execution_duration: Duration::from_millis(50),
             init_shared_barrier,
+            start_ts: Instant::now(),
         }
     }
 
     /// Try to pin the calling thread to a free core if there is one left. If not,
     /// the thread remains unpinned.
-    fn try_set_sched_affinity() {
-        let free_core = get_next_unpinned_core().expect("No free core left");
+    #[allow(unused)]
+    fn try_set_sched_affinity(uid: WorkerUid) {
+        // if env::var("FT_NO_AFFINITY").is_ok() {
+        //     return;
+        // }
+        return;
 
-        unsafe {
-            let mut msk = mem::zeroed::<libc::cpu_set_t>();
-            CPU_SET(free_core, &mut msk);
-            let ret = libc::sched_setaffinity(0, mem::size_of_val(&msk), &msk);
-            assert_eq!(ret, 0, "Failed to bind to free core {}", free_core);
+        let free_core = get_next_unpinned_core();
+        if let Some(free_core) = free_core {
+            unsafe {
+                let mut msk = mem::zeroed::<libc::cpu_set_t>();
+                CPU_SET(free_core, &mut msk);
+                let ret = libc::sched_setaffinity(0, mem::size_of_val(&msk), &msk);
+                assert_eq!(ret, 0, "Failed to bind to free core {}", free_core);
+            }
+            log::info!("Pinning {uid:?} to core {free_core}");
+        } else {
+            log::warn!("No core left to pin worker {uid:?} to")
         }
-
-        log::info!("Pinning to core {:?}", free_core);
     }
 
     /// Spawn the new work and start fuzzing. This will consume self and
@@ -360,7 +382,7 @@ impl FuzzingWorker {
         let thread_handle = thread::Builder::new()
             .name(uid.to_string())
             .spawn(move || {
-                FuzzingWorker::try_set_sched_affinity();
+                FuzzingWorker::try_set_sched_affinity(uid);
                 self.fuzzing_main_loop()
             })?;
 

@@ -1,0 +1,287 @@
+diff --git a/afl-fuzz.c b/afl-fuzz.c
+index 3b0ed0a..4871d68 100644
+--- a/afl-fuzz.c
++++ b/afl-fuzz.c
+@@ -3861,7 +3861,7 @@ static void pivot_inputs(void) {
+       u8* use_name = strstr(rsl, ",orig:");
+ 
+       if (use_name) use_name += 6; else use_name = rsl;
+-      nfn = alloc_printf("%s/queue/id:%06u,orig:%s", out_dir, id, use_name);
++      nfn = alloc_printf("%s/queue/id:%06u,ts:%lld,orig:%s", out_dir, id, get_cur_time() - start_time, use_name);
+ 
+ #else
+ 
+@@ -4005,8 +4005,8 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
+ 
+ #ifndef SIMPLE_FILES
+ 
+-    fn = alloc_printf("%s/queue/id:%06u,%s", out_dir, queued_paths,
+-                      describe_op(hnb));
++    fn = alloc_printf("%s/queue/id:%06u,ts:%lld,%s", out_dir, queued_paths,
++                      get_cur_time() - start_time, describe_op(hnb));
+ 
+ #else
+ 
+@@ -4099,8 +4099,8 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
+ 
+ #ifndef SIMPLE_FILES
+ 
+-      fn = alloc_printf("%s/replayable-hangs/id:%06llu,%s", out_dir,
+-                        unique_hangs, describe_op(0));
++      fn = alloc_printf("%s/replayable-hangs/id:%06llu,ts:%lld,%s", out_dir,
++                        unique_hangs, get_cur_time() - start_time, describe_op(0));
+ 
+ #else
+ 
+@@ -4143,8 +4143,8 @@ keep_as_crash:
+ 
+ #ifndef SIMPLE_FILES
+ 
+-      fn = alloc_printf("%s/replayable-crashes/id:%06llu,sig:%02u,%s", out_dir,
+-                        unique_crashes, kill_signal, describe_op(0));
++      fn = alloc_printf("%s/replayable-crashes/id:%06llu,ts:%lld,sig:%02u,%s", out_dir,
++                        unique_crashes, get_cur_time() - start_time, kill_signal, describe_op(0));
+ 
+ #else
+ 
+@@ -9085,6 +9085,9 @@ int main(int argc, char** argv) {
+         }else if (!strcmp(optarg, "SNMP")) {
+           extract_requests = &extract_requests_SNMP;
+           extract_response_codes = &extract_response_codes_SNMP;
++        } else if (!strcmp(optarg, "NOP")) {
++          extract_requests = &extract_requests_nop;
++          extract_response_codes = &extract_response_codes_nop;
+         } else {
+           FATAL("%s protocol is not supported yet!", optarg);
+         }
+@@ -9156,6 +9159,7 @@ int main(int argc, char** argv) {
+             "afl-fuzz with sudo or by \"$ setcap cap_sys_admin+ep /path/to/afl-fuzz\".", netns_name);
+   }
+ 
++  start_time = get_cur_time();
+   setup_signal_handlers();
+   check_asan_opts();
+ 
+@@ -9230,8 +9234,6 @@ int main(int argc, char** argv) {
+ 
+   check_binary(argv[optind]);
+ 
+-  start_time = get_cur_time();
+-
+   if (qemu_mode)
+     use_argv = get_qemu_argv(argv[0], argv + optind, argc - optind);
+   else
+diff --git a/aflnet.c b/aflnet.c
+index a527b7e..b4fef7e 100644
+--- a/aflnet.c
++++ b/aflnet.c
+@@ -1105,6 +1105,27 @@ region_t* extract_requests_http(unsigned char* buf, unsigned int buf_size, unsig
+   return regions;
+ }
+ 
++region_t* extract_requests_nop(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
++{
++  unsigned int region_count = 0;
++  region_t *regions = NULL;
++
++  //in case region_count equals zero, it means that the structure of the buffer is broken
++  //hence we create one region for the whole buffer
++  if ((region_count == 0) && (buf_size > 0)) {
++    regions = (region_t *)ck_realloc(regions, sizeof(region_t));
++    regions[0].start_byte = 0;
++    regions[0].end_byte = buf_size - 1;
++    regions[0].state_sequence = NULL;
++    regions[0].state_count = 0;
++
++    region_count = 1;
++  }
++
++  *region_count_ref = region_count;
++  return regions;
++}
++
+ region_t* extract_requests_ipp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+ {
+   char *mem;
+@@ -2137,6 +2158,16 @@ unsigned int* extract_response_codes_http(unsigned char* buf, unsigned int buf_s
+   return state_sequence;
+ }
+ 
++unsigned int* extract_response_codes_nop(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
++{
++  unsigned int* state_sequence = (unsigned int *)ck_realloc(state_sequence, 3 * sizeof(unsigned int));
++  state_sequence[0] = 0;
++  state_sequence[1] = 1;
++  state_sequence[2] = 0;
++  *state_count_ref = 2;
++  return state_sequence;
++}
++
+ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+ {
+   char *mem;
+diff --git a/aflnet.h b/aflnet.h
+index d4a0fdc..10aab79 100644
+--- a/aflnet.h
++++ b/aflnet.h
+@@ -74,6 +74,7 @@ unsigned int* extract_response_codes_tftp(unsigned char* buf, unsigned int buf_s
+ unsigned int* extract_response_codes_SNTP(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_NTP(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_SNMP(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
++unsigned int* extract_response_codes_nop(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ extern unsigned int* (*extract_response_codes)(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ 
+ region_t* extract_requests_smtp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+@@ -92,6 +93,7 @@ region_t* extract_requests_dhcp(unsigned char* buf, unsigned int buf_size, unsig
+ region_t* extract_requests_SNTP(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_NTP(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_SNMP(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
++region_t* extract_requests_nop(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ extern region_t* (*extract_requests)(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ 
+ // Network communication functions
+diff --git a/llvm_mode/afl-clang-fast.c b/llvm_mode/afl-clang-fast.c
+index c154e01..8a2ee5a 100644
+--- a/llvm_mode/afl-clang-fast.c
++++ b/llvm_mode/afl-clang-fast.c
+@@ -40,6 +40,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++
++
+ static u8*  obj_path;               /* Path to runtime libraries         */
+ static u8** cc_params;              /* Parameters passed to the real CC  */
+ static u32  cc_par_cnt = 1;         /* Param count, including argv0      */
+@@ -131,10 +133,11 @@ static void edit_params(u32 argc, char** argv) {
+   cc_params[cc_par_cnt++] = "-mllvm";
+   cc_params[cc_par_cnt++] = "-sanitizer-coverage-block-threshold=0";
+ #else
+-  cc_params[cc_par_cnt++] = "-Xclang";
+-  cc_params[cc_par_cnt++] = "-load";
+-  cc_params[cc_par_cnt++] = "-Xclang";
+-  cc_params[cc_par_cnt++] = alloc_printf("%s/afl-llvm-pass.so", obj_path);
++  // cc_params[cc_par_cnt++] = "-Xclang";
++  // cc_params[cc_par_cnt++] = "-load";
++  // cc_params[cc_par_cnt++] = "-Xclang";
++  // cc_params[cc_par_cnt++] = alloc_printf("%s/afl-llvm-pass.so", obj_path);
++  cc_params[cc_par_cnt++]  = alloc_printf("-fpass-plugin=%s/afl-llvm-pass.so", obj_path);
+ #endif /* ^USE_TRACE_PC */
+ 
+   cc_params[cc_par_cnt++] = "-Qunused-arguments";
+@@ -163,7 +166,8 @@ static void edit_params(u32 argc, char** argv) {
+     if (!strcmp(cur, "-shared")) maybe_linking = 0;
+ 
+     if (!strcmp(cur, "-Wl,-z,defs") ||
+-        !strcmp(cur, "-Wl,--no-undefined")) continue;
++        !strcmp(cur, "-Wl,--no-undefined") ||
++        !strcmp(cur, "-Wl,-no-undefined")) continue;
+ 
+     cc_params[cc_par_cnt++] = cur;
+ 
+diff --git a/llvm_mode/afl-llvm-pass.so.cc b/llvm_mode/afl-llvm-pass.so.cc
+index 154a5db..b7b096c 100644
+--- a/llvm_mode/afl-llvm-pass.so.cc
++++ b/llvm_mode/afl-llvm-pass.so.cc
+@@ -43,34 +43,26 @@
+ #include "llvm/IR/LegacyPassManager.h"
+ #include "llvm/IR/Module.h"
+ #include "llvm/Support/Debug.h"
+-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
++
++#include "llvm/Passes/PassBuilder.h"
++#include "llvm/Passes/PassPlugin.h"
++
++constexpr std::nullopt_t None = std::nullopt;
+ 
+ using namespace llvm;
+ 
+ namespace {
+ 
+-  class AFLCoverage : public ModulePass {
++  class AFLCoverage : public PassInfoMixin<AFLCoverage> {
+ 
+     public:
+-
+-      static char ID;
+-      AFLCoverage() : ModulePass(ID) { }
+-
+-      bool runOnModule(Module &M) override;
+-
+-      // StringRef getPassName() const override {
+-      //  return "American Fuzzy Lop Instrumentation";
+-      // }
+-
++      PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
+   };
+ 
+ }
+ 
+ 
+-char AFLCoverage::ID = 0;
+-
+-
+-bool AFLCoverage::runOnModule(Module &M) {
++PreservedAnalyses AFLCoverage::run(Module &M, ModuleAnalysisManager &MAM) {
+ 
+   LLVMContext &C = M.getContext();
+ 
+@@ -131,20 +123,20 @@ bool AFLCoverage::runOnModule(Module &M) {
+ 
+       /* Load prev_loc */
+ 
+-      LoadInst *PrevLoc = IRB.CreateLoad(AFLPrevLoc);
++      LoadInst *PrevLoc = IRB.CreateLoad(Int32Ty, AFLPrevLoc);
+       PrevLoc->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+       Value *PrevLocCasted = IRB.CreateZExt(PrevLoc, IRB.getInt32Ty());
+ 
+       /* Load SHM pointer */
+ 
+-      LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr);
++      LoadInst *MapPtr = IRB.CreateLoad(IRB.getInt8PtrTy(), AFLMapPtr);
+       MapPtr->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+       Value *MapPtrIdx =
+-          IRB.CreateGEP(MapPtr, IRB.CreateXor(PrevLocCasted, CurLoc));
++          IRB.CreateGEP(Int8Ty, MapPtr, IRB.CreateXor(PrevLocCasted, CurLoc));
+ 
+       /* Update bitmap */
+ 
+-      LoadInst *Counter = IRB.CreateLoad(MapPtrIdx);
++      LoadInst *Counter = IRB.CreateLoad(Int8Ty, MapPtrIdx);
+       Counter->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+       Value *Incr = IRB.CreateAdd(Counter, ConstantInt::get(Int8Ty, 1));
+       IRB.CreateStore(Incr, MapPtrIdx)
+@@ -172,21 +164,19 @@ bool AFLCoverage::runOnModule(Module &M) {
+ 
+   }
+ 
+-  return true;
+-
++  return PreservedAnalyses::none();
+ }
+ 
+ 
+-static void registerAFLPass(const PassManagerBuilder &,
+-                            legacy::PassManagerBase &PM) {
+-
+-  PM.add(new AFLCoverage());
+-
+-}
+-
+ 
+-static RegisterStandardPasses RegisterAFLPass(
+-    PassManagerBuilder::EP_ModuleOptimizerEarly, registerAFLPass);
++extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
++llvmGetPassPluginInfo() {
++  return {LLVM_PLUGIN_API_VERSION, "aflnet-pass", "v0.1",
++          [](PassBuilder &PB) {
++            PB.registerOptimizerLastEPCallback(
++                [](ModulePassManager &MPM, OptimizationLevel OL) {
++                  MPM.addPass(AFLCoverage());
++                });
++          }};
+ 
+-static RegisterStandardPasses RegisterAFLPass0(
+-    PassManagerBuilder::EP_EnabledOnOptLevel0, registerAFLPass);
++}
+\ No newline at end of file

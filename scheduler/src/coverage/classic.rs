@@ -289,7 +289,7 @@ impl TraceManager {
     fn save_trace(&self, input: impl AsRef<Path>, trace: coverage_trace::Trace) -> Result<()> {
         let name = input.as_ref().file_name().unwrap();
 
-        let mut logfile_path = self.general_config.traces_directory();
+        let mut logfile_path = self.general_config.llvm_cov_directory();
 
         logfile_path.push(format!("trace_{}.json", name.to_str().unwrap()));
 
@@ -427,12 +427,6 @@ impl TraceManager {
                 .exists()
         );
 
-        let uid_gid = self.general_config.jail_uid_gid();
-        if let Some((uid, gid)) = uid_gid {
-            jail::acquire_privileges()?;
-            jail::drop_privileges(uid, gid, true)?;
-        }
-
         log::trace!("Creating new ThreadPoolBuilder");
         rayon::ThreadPoolBuilder::new()
             .num_threads(jobs)
@@ -465,15 +459,15 @@ impl TraceManager {
 }
 
 /// Run the exploration mode for the given `config`.
-pub fn trace_interesting(
+pub fn trace(
     config: &Config,
     input_dirs: Vec<PathBuf>,
     exit_requested: Arc<AtomicBool>,
     jobs: Option<usize>,
-    timeout: Option<Duration>,
+    timeout: Duration,
 ) -> Result<()> {
     log::trace!("Tracing interesting inputs..");
-    fs::create_dir_all(config.general.traces_directory())?;
+    fs::create_dir_all(config.general.llvm_cov_directory())?;
 
     let tracer = TraceManager::new(
         &config.general,
@@ -486,7 +480,7 @@ pub fn trace_interesting(
     log::debug!("Found {} targets to trace", files_to_trace.len());
     let jobs = jobs.unwrap_or(1);
     log::trace!("Using {} jobs", jobs);
-    tracer.trace_files(files_to_trace, jobs, timeout)?;
+    tracer.trace_files(files_to_trace, jobs, Some(timeout))?;
 
     Ok(())
 }

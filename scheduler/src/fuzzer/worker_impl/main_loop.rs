@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rand::{distributions::WeightedIndex, prelude::Distribution, thread_rng};
-use std::{ops::ControlFlow, sync::mpsc};
+use std::{ops::ControlFlow, sync::mpsc, thread, time::Duration};
 
 use crate::fuzzer::{
     common::CalibrationError, worker::FuzzingWorker, worker_impl::phases::FuzzingPhase,
@@ -69,6 +69,7 @@ impl FuzzingWorker {
                 }
                 Ok(None) => {
                     // Entry is currently not traceable, try next.
+                    thread::sleep(Duration::from_millis(100));
                     continue;
                 }
             }
@@ -121,7 +122,10 @@ impl FuzzingWorker {
     fn fuzz_selected_entry(&mut self) -> Result<()> {
         let _rng = rand::thread_rng();
         let entry = self.state.entry();
-        self.load_queue_entry_mutations(&entry)?;
+        unsafe {
+            // Safety: We are at the beginning of a fuzzing cycle, so there are no pointers into the cache.
+            self.load_queue_entry_mutations(&entry)?;
+        }
 
         let source = self.source.as_mut().unwrap();
         let _mc_len = source.mutation_cache_apply_fn(|e| e.len());

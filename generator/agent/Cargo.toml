@@ -6,6 +6,9 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[build-dependencies]
+glob = "0.3.1"
+
 [dependencies]
 anyhow = "~1"
 chrono = "~0"
@@ -14,8 +17,8 @@ fuzztruction_shared = { path = "../../fuzztruction_shared" }
 keystone = { git = "https://github.com/keystone-engine/keystone", tag = "0.9.2" }
 lazy_static = "~1"
 libc = "~0"
-llvm_stackmap =  {version = "0.1.4", features = ["serde"] }
-log = { version = "~0", features = ["kv_unstable"] }
+llvm_stackmap = { workspace = true, features = ["serde"] }
+log = { workspace = true }
 nix = "~0"
 posixmq = "~0"
 proc-maps = "~0"
@@ -23,6 +26,7 @@ serde = { version = "~1", features = ["derive"]}
 serde_json = "~1"
 thiserror = "~1"
 ansi_term = "0.12"
+byte-unit = "5.1.4"
 
 [dependencies.memoffset]
 version = "~0"

@@ -64,7 +64,7 @@ impl Bitmap {
         };
         assert!(shm_id != -1);
 
-        let shm_addr = unsafe { libc::shmat(shm_id, ptr::null() as *const libc::c_void, 0) };
+        let shm_addr = unsafe { libc::shmat(shm_id, ptr::null(), 0) };
         assert_ne!(shm_addr, -1i32 as *mut libc::c_void);
 
         // Init with fill pattern.

@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use fuzztruction_shared::mutation_cache_entry::MutationCacheEntry;
+use fuzztruction_shared::{mutation_cache_entry::MutationCacheEntry, util::DEBUG_CHECKS_ENABLED};
 
 use crate::{
     constants::FUZZING_LOOP_UPDATE_INTERVAL,
@@ -29,6 +29,7 @@ impl FuzzingWorker {
     /// # Errors
     ///
     /// Every Error returned by this function must be considered fatal.
+    ///
     #[allow(clippy::type_complexity)]
     pub fn fuzz_candidates(
         &mut self,
@@ -40,8 +41,10 @@ impl FuzzingWorker {
         skip_mce_after_first_path: bool,
     ) -> Result<()> {
         let qe = self.state.entry();
-        let qe_input = qe.input();
-        let source_input_bytes = qe_input.data();
+        assert!(!qe.is_crash());
+
+        let source_input = qe.input();
+        let source_input_bytes = source_input.data();
         let mut scratch_buffer = Vec::<u8>::with_capacity(1024 * 1024);
         let current_phase = self.state.phase();
 
@@ -74,25 +77,30 @@ impl FuzzingWorker {
             iteration_total_execs_required
         );
         let fuzz_start_ts = Instant::now();
-        let phase_start_successful_execs = iteration_stats.successful_source_execs;
-        let mut timeout_exceeded = false;
+        let phase_start_successful_source_execs = iteration_stats.successful_source_execs;
         let mut iteration_configuration = None;
 
         // consecutively apply all mutations and check result.
-        'exit: for e in mutations {
-            let target_mce = e.0;
-            let mutators = e.1;
+        'exit: for mce in mutations {
+            let target_mce = mce.0;
+            let mutators = mce.1;
             let is_nop = target_mce.is_nop();
-            self.state.set_patch_point(target_mce.id());
             let mce_start_paths_cnt = iteration_stats.paths();
+            let mce_fuzz_start_ts = Instant::now();
+            let mce_start_successful_source_execs = iteration_stats.successful_source_execs;
+
+            self.state.set_patch_point(target_mce.id());
 
             if target_mce.msk_len() == 0 {
                 log::error!("Trying to fuzz mutation entry with zero sized msk.");
                 continue;
             }
-            let msk_copy = target_mce.get_msk_as_slice().to_vec();
-            assert_eq!(msk_copy, target_mce.get_msk_as_slice(),);
 
+            // copy mask for comparing it after fuzzing is done
+            let msk_copy = target_mce.get_msk_as_slice().to_vec();
+            debug_assert_eq!(msk_copy, target_mce.get_msk_as_slice(),);
+
+            // Apply all mutators to the current `mce` (MutationCacheEntry)
             'mce: for mutator in mutators {
                 self.state
                     .set_mutator(mutator.mutator_type(), mutator.steps_total());
@@ -146,6 +154,7 @@ impl FuzzingWorker {
                         let iteration_execs_done = iteration_stats.execs;
                         let execs_left =
                             iteration_total_execs_required - iteration_execs_done as usize;
+
                         log::debug!(
                             "Completed {} of {} executions (progress={:.02}%, left={}, execs/s={:.02}, time_left={:?}, phase={:?})",
                             iteration_execs_done,
@@ -168,12 +177,30 @@ impl FuzzingWorker {
                             iteration_no_new_coverage_timeout,
                             &iteration_stats,
                         ) {
-                            timeout_exceeded = true;
+                            // No sync check needed since we exit the loop.
                             break 'exit;
+                        }
+
+                        let no_successful_exec_time_limit = Duration::from_secs(60);
+                        if mce_start_successful_source_execs
+                            == iteration_stats.successful_source_execs
+                            && mce_fuzz_start_ts.elapsed() > no_successful_exec_time_limit
+                        {
+                            log::warn!(
+                                "MCE {:?} had no successful execution for {:?}, skipping",
+                                target_mce.id(),
+                                no_successful_exec_time_limit
+                            );
+                            one_shot.then(|| target_mce.disable());
+                            if sync_needed {
+                                self.source.as_mut().unwrap().sync_mutations()?;
+                            }
+                            break 'mce;
                         }
                     }
                 }
-                if msk_copy != target_mce.get_msk_as_slice() {
+
+                if DEBUG_CHECKS_ENABLED && msk_copy != target_mce.get_msk_as_slice() {
                     log::error!(
                         "Mutator {:?} left MCE in a dirty state! {:?}!={:?}",
                         mutator_type,
@@ -208,14 +235,6 @@ impl FuzzingWorker {
             assert_eq!(is_nop, target_mce.is_nop(), "Mutator left ");
         }
 
-        let iteration_execs_done = iteration_stats.execs;
-        log::debug!(
-            "Iteration finished (execs_done={}, exec_required={}, left={})",
-            iteration_execs_done,
-            iteration_total_execs_required,
-            iteration_total_execs_required - iteration_execs_done as usize
-        );
-
         {
             // This is only true if we had an early exit through the 'exit label.
             if let Some(mut configuration) = iteration_configuration.take() {
@@ -230,34 +249,21 @@ impl FuzzingWorker {
 
         // Sanity check whether the fuzzer continuously crashes.
         let limit = Duration::from_secs(600);
-        if phase_start_successful_execs == iteration_stats.successful_source_execs
+        if phase_start_successful_source_execs == iteration_stats.successful_source_execs
             && fuzz_start_ts.elapsed() > limit
         {
-            log::error!(
-                "Fuzzer had no successful execution since {:?}! iteration_stats={:#?}",
+            log::warn!(
+                "Worker {:?} had no successful execution since {:?}! iteration_stats={:#?}",
+                self.uid(),
                 limit,
                 iteration_stats,
             );
         }
 
-        // No point in printing the estimation error if this is an early exit.
-        // Same is true if we skip MCE's if we find a path.
-        if !timeout_exceeded && !skip_mce_after_first_path {
-            let time_spend = fuzz_start_ts.elapsed();
-            #[allow(clippy::cast_possible_wrap)]
-            let diff_ms = time_spend.as_millis() as i128 - estimated_runtime.as_millis() as i128;
-            log::info!(
-                "Fuzzing took {} seconds ({} ms). actual-estimated={} ms ({:.02})",
-                time_spend.as_secs(),
-                time_spend.as_millis(),
-                diff_ms,
-                diff_ms as f64 / (time_spend.as_millis() as f64 / 100.0),
-            );
-        }
-
-        // snyc the locally stored [FuzzerEventCounter] to the global one.
+        // sync the locally stored [FuzzerEventCounter] to the global one.
         let mut shared_stats = self.stats.lock().unwrap();
         *shared_stats += &iteration_stats;
+
         log::info!("round   stats: {:#?}", iteration_stats);
         log::info!("overall stats: {:#?}", shared_stats);
 
@@ -265,7 +271,7 @@ impl FuzzingWorker {
     }
 }
 
-/// Check if we did not found a new path or crash during since `no_new_coverage_timeout` long.
+/// Check if we did not found a new path or crash for `no_new_coverage_timeout` long.
 /// If `no_new_coverage_timeout` is None, `stats.start_ts` is used instead.
 fn check_if_no_new_coverage_timeout_was_exceeded(
     no_new_coverage_timeout: Option<Duration>,
@@ -282,7 +288,7 @@ fn check_if_no_new_coverage_timeout_was_exceeded(
         // finding happend less than `no_new_coverage_timeout` ago.
         if let Some(time_since_last_path) = stats.time_since_last_new_path_or_crash() {
             if time_since_last_path > no_new_coverage_timeout {
-                log::warn!(
+                log::debug!(
                     "Iteration timeout {:?} exceeded, canceling iteration.",
                     no_new_coverage_timeout
                 );
@@ -290,7 +296,7 @@ fn check_if_no_new_coverage_timeout_was_exceeded(
             }
         } else {
             // No new path found so far -> cancel phase.
-            log::warn!(
+            log::debug!(
                 "Iteration timeout {:?} exceeded, canceling iteration.",
                 no_new_coverage_timeout
             );

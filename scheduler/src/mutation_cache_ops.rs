@@ -4,14 +4,14 @@ use fuzztruction_shared::{
     mutation_cache::MutationCache, mutation_cache_entry::MutationCacheEntry,
 };
 
-use crate::{patchpoint::PatchPoint, trace::Trace};
+use crate::{mutation_site::MutationSite, trace::Trace};
 
 pub trait MutationCacheOpsEx {
     /// Construct a `MutationCache` from `PatchPoint`s.
     #[allow(single_use_lifetimes)]
     fn from_patchpoints<'a, I>(patch_points: I) -> Result<MutationCache>
     where
-        I: Iterator<Item = &'a PatchPoint>;
+        I: Iterator<Item = &'a MutationSite>;
     /// Remove `MutationCacheEntry`s that are not covered by `trace`.
     ///
     /// # Safety
@@ -39,7 +39,7 @@ impl MutationCacheOpsEx for MutationCache {
     #[allow(single_use_lifetimes)]
     fn from_patchpoints<'a, I>(patch_points: I) -> Result<MutationCache>
     where
-        I: Iterator<Item = &'a PatchPoint>,
+        I: Iterator<Item = &'a MutationSite>,
     {
         let mut ret = MutationCache::new()?;
         for p in patch_points {
@@ -62,7 +62,7 @@ impl MutationCacheOpsEx for MutationCache {
         let mut resized_entries = Vec::new();
         for entry in self.iter_mut() {
             if let Some(v) = map.get(&entry.id()) {
-                let e = entry.clone_with_new_msk((*v) as u32 * u32::from(entry.loc_size()));
+                let e = entry.clone_with_new_msk((*v) as u32 * u32::from(entry.chunk_size_bytes()));
                 resized_entries.push(e);
             }
         }
@@ -84,7 +84,7 @@ impl MutationCacheOpsEx for MutationCache {
         let mut resized_entries = Vec::new();
         for entry in self.iter_mut() {
             if let Some(v) = map.get(&entry.id()) {
-                let e = entry.clone_with_new_msk((*v) as u32 * u32::from(entry.loc_size()));
+                let e = entry.clone_with_new_msk((*v) as u32 * u32::from(entry.chunk_size_bytes()));
                 resized_entries.push(e);
             }
         }

@@ -5,6 +5,7 @@ authors = ["Nils Bars <nils.bars@rub.de>"]
 edition = "2018"
 
 [dependencies]
+#ipc-channel.workspace = true
 shared_memory = {git = "https://github.com/elast0ny/shared_memory-rs", rev = "4879c7641f64d444420b81fd32f496939ee7155d", package = "shared_memory"}
 posixmq = "~0"
 strum_macros = "~0"
@@ -17,12 +18,16 @@ lazy_static = "~1"
 signal-hook = "~0"
 anyhow = "~1"
 thiserror = "~1"
-log = { version = "~0", features = ["kv_unstable", "serde"] }
+log = { workspace = true }
 fern = "~0"
 md5 = "0.7.0"
-nix = "~0"
+nix = { version = "~0", features = ["signal"] }
 byte-unit = "4.0.13"
-llvm_stackmap =  {version = "0.1.4", features = ["serde"] }
+llvm_stackmap = { workspace = true, features = ["serde"] }
+serde_with = "3.4.0"
+syscalls = "0.6.18"
+filedescriptor = "0.8.2"
+scopeguard = "1.2.0"
 
 [dependencies.memoffset]
 version = "~0"

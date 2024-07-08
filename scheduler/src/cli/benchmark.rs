@@ -6,7 +6,9 @@ use std::time::Instant;
 
 use ahash::AHasher;
 use scheduler::config::Config;
+use scheduler::constants::DEFAULT_CALIBRATION_TIMEOUT;
 use scheduler::fuzzer::queue::Input;
+
 use scheduler::mutation_cache::MutationCache;
 use scheduler::mutation_cache_ops::MutationCacheOpsEx;
 
@@ -28,8 +30,8 @@ pub fn benchmark_target(
     assert!((0f64..=1f64).contains(&sink_exec_prop));
 
     let mut tmp_buffer = Vec::<u8>::new();
-    let mut source = Source::from_config(config, None).unwrap();
-    let mut sink = AflSink::from_config(config, None).unwrap();
+    let mut source = Source::from_config(config, None, None).unwrap();
+    let mut sink = AflSink::from_config(config, None, None).unwrap();
     source.start().expect("Failed to start source");
     sink.start().expect("Failed to start sink");
 
@@ -40,11 +42,11 @@ pub fn benchmark_target(
     let patchpoints = source.get_patchpoints().unwrap();
     println!("Target binary has {:#?} patch points.", patchpoints.len());
 
-    //let patchpoints = patchpoints.iter().cloned().take(5000).collect::<Vec<_>>();
-
     if with_mutations {
         let mcache = MutationCache::from_patchpoints(patchpoints.iter()).unwrap();
-        source.mutation_cache_replace(&mcache).unwrap();
+        unsafe {
+            source.mutation_cache_replace(&mcache).unwrap();
+        }
 
         log::info!("Tracing target, this might take some seconds...");
         log::info!("Timeout is {:?}", config.general.tracing_timeout);
@@ -93,7 +95,9 @@ pub fn benchmark_target(
             );
             let mc = source.mutation_cache();
             let mut mc_mut = mc.borrow_mut();
-            mc_mut.limit(max_mutations);
+            unsafe {
+                mc_mut.limit(max_mutations);
+            }
         }
 
         let mc = source.mutation_cache();
@@ -124,7 +128,7 @@ pub fn benchmark_target(
         for _ in 0..iter_cnt {
             source.write(input.data());
 
-            let run_result = source.run(config.general.timeout).unwrap();
+            let run_result = source.run(DEFAULT_CALIBRATION_TIMEOUT).unwrap();
             match run_result {
                 ref _x @ RunResult::Terminated { .. } => (),
                 _ => {
@@ -146,7 +150,7 @@ pub fn benchmark_target(
             let r = rng.gen_range(0.0..1.0);
             if r < sink_exec_prop {
                 sink.write(&tmp_buffer);
-                let ret = sink.run(config.general.timeout).unwrap();
+                let ret = sink.run(DEFAULT_CALIBRATION_TIMEOUT).unwrap();
                 match ret {
                     sink::RunResult::Terminated(..) => {
                         let bm = sink.bitmap();

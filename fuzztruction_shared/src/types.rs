@@ -4,25 +4,25 @@ use std::{collections::HashMap, sync::Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(C)]
-pub struct PatchPointID(pub u64);
+pub struct MutationSiteID(pub u64);
 
-static PATCH_POINT_ID_INVALID: u64 = 0;
+static MUTATION_SITE_ID_INVALID: u64 = 0;
 lazy_static! {
-    static ref PATCH_POINT_ID_CTR: Mutex<u64> = Mutex::new(PATCH_POINT_ID_INVALID + 1);
-    static ref PATCH_POINT_ID_MAP: Mutex<HashMap<(usize, usize, usize), PatchPointID>> =
+    static ref MUTATION_SITE_ID_CTR: Mutex<u64> = Mutex::new(MUTATION_SITE_ID_INVALID + 1);
+    static ref MUTATION_SITE_ID_MAP: Mutex<HashMap<(usize, usize, usize), MutationSiteID>> =
         Mutex::new(HashMap::new());
 }
 
-impl PatchPointID {
-    pub fn get(base_offset: usize, inode: usize, section_file_offset: usize) -> PatchPointID {
-        let mut ctr = PATCH_POINT_ID_CTR.lock().unwrap();
-        let mut map = PATCH_POINT_ID_MAP.lock().unwrap();
+impl MutationSiteID {
+    pub fn get(base_offset: usize, inode: usize, section_file_offset: usize) -> MutationSiteID {
+        let mut ctr = MUTATION_SITE_ID_CTR.lock().unwrap();
+        let mut map = MUTATION_SITE_ID_MAP.lock().unwrap();
 
         let key = (base_offset, inode, section_file_offset);
         if let Some(id) = map.get(&key) {
             id.clone()
         } else {
-            let val = PatchPointID(*ctr);
+            let val = MutationSiteID(*ctr);
             let had_val = map.insert(key, val.clone());
             assert!(
                 had_val.is_none(),
@@ -34,43 +34,43 @@ impl PatchPointID {
         }
     }
 
-    pub fn invalid() -> PatchPointID {
-        PatchPointID(PATCH_POINT_ID_INVALID)
+    pub fn invalid() -> MutationSiteID {
+        MutationSiteID(MUTATION_SITE_ID_INVALID)
     }
 }
 
-impl ToString for PatchPointID {
+impl ToString for MutationSiteID {
     fn to_string(&self) -> String {
         format!("PatchPointID({})", self.0)
     }
 }
 
-impl From<PatchPointID> for u64 {
-    fn from(pp: PatchPointID) -> Self {
+impl From<MutationSiteID> for u64 {
+    fn from(pp: MutationSiteID) -> Self {
         pp.0
     }
 }
 
-impl From<u64> for PatchPointID {
+impl From<u64> for MutationSiteID {
     fn from(v: u64) -> Self {
-        PatchPointID(v)
+        MutationSiteID(v)
     }
 }
 
-impl From<usize> for PatchPointID {
+impl From<usize> for MutationSiteID {
     fn from(v: usize) -> Self {
-        PatchPointID(v as u64)
+        MutationSiteID(v as u64)
     }
 }
 
-impl From<&PatchPointID> for usize {
-    fn from(pp: &PatchPointID) -> Self {
+impl From<&MutationSiteID> for usize {
+    fn from(pp: &MutationSiteID) -> Self {
         pp.0 as usize
     }
 }
 
-impl From<PatchPointID> for usize {
-    fn from(pp: PatchPointID) -> Self {
+impl From<MutationSiteID> for usize {
+    fn from(pp: MutationSiteID) -> Self {
         pp.0 as usize
     }
 }

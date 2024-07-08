@@ -193,8 +193,6 @@ impl DwarfReg {
     }
 
     pub fn name_with_size(&self, size: u8) -> Option<String> {
-        // FIXME: We could return &'static str here if we use macros
-        // in the macros above to construct strings with static lifetime.
 
         const XMM0_ID: u16 = DwarfReg::Xmm0 as u16;
         const XMM15_ID: u16 = DwarfReg::Xmm15 as u16;
@@ -266,6 +264,16 @@ impl DwarfReg {
             }
             // Unsupported reg.
             _ => return None,
+        }
+    }
+
+    pub fn mem_ptr_prefix(size: usize) -> &'static str {
+        match size {
+            1 => "byte",
+            2 => "word",
+            4 => "dword",
+            8 => "qword",
+            _ => unimplemented!("{}", size),
         }
     }
 }

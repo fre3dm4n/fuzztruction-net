@@ -1,12 +1,18 @@
 use rand::{self, Rng};
 use serde::{Deserialize, Serialize};
-use std::{cmp, fmt, sync::Arc, time::Duration};
+use std::{
+    cmp, fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum MutatorType {
     Nop,
     FlipBit,
     FlipByte,
+    FlipOnce,
+    RandomBit(usize),
     RandomByte(usize),
     U8Counter,
     Havoc,
@@ -50,91 +56,170 @@ pub trait Mutator: Iterator + fmt::Debug {
     }
 }
 
-// /// A Mutator that replaces a byte at a random index with a random value.
-// pub struct RandomByte<'a> {
-//     /// The buffer that is mutated.
-//     buffer: &'a mut [u8],
-//     /// Number of iterations we already performed.
-//     current_step: usize,
-//     /// Maximum number of iterations.
-//     max_step: usize,
-//     /// Index of the last byte we mutated.
-//     last_idx: Option<usize>,
-//     /// The original value of the byte that we mutated.
-//     orig_byte: u8,
-// }
+pub struct WithTimeout<T: Mutator> {
+    mutator: T,
+    timeout: Duration,
+    start_ts: Option<Instant>,
+}
+impl<T: Mutator> WithTimeout<T> {
+    pub fn new(mutator: T, timeout: Duration) -> WithTimeout<T> {
+        WithTimeout {
+            mutator,
+            timeout,
+            start_ts: None,
+        }
+    }
+}
 
-// impl RandomByte<'_> {
-//     pub fn new(buffer: &mut [u8], steps: usize) -> RandomByte {
-//         RandomByte {
-//             buffer,
-//             current_step: 0,
-//             max_step: steps,
-//             last_idx: None,
-//             orig_byte: 0,
-//         }
-//     }
-// }
+impl<T: fmt::Debug + Mutator> fmt::Debug for WithTimeout<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TimeoutMutator")
+            .field("mutator", &self.mutator)
+            .finish()
+    }
+}
 
-// impl fmt::Debug for RandomByte<'_> {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         f.debug_struct("RandomByte")
-//             .field("current_step", &self.current_step)
-//             .field("max_step", &self.max_step)
-//             .field("last_idx", &self.last_idx)
-//             .field("orig_byte", &self.orig_byte)
-//             .field("buffer.len()", &self.buffer.len())
-//             .finish_non_exhaustive()
-//     }
-// }
+impl<T> Iterator for WithTimeout<T>
+where
+    T: Mutator + Iterator,
+{
+    type Item = T::Item;
 
-// impl Mutator for RandomByte<'_> {
-//     fn steps_total(&self) -> usize {
-//         self.max_step
-//     }
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start_ts.is_none() {
+            self.start_ts = Some(Instant::now());
+        }
 
-//     fn steps_done(&self) -> usize {
-//         self.current_step
-//     }
+        if self.start_ts.unwrap().elapsed() > self.timeout {
+            log::debug!(
+                "Mutator {:?} exceeded timeout of {:?}",
+                self.mutator.mutator_type(),
+                self.timeout
+            );
+            return None;
+        }
 
-//     fn mutator_type(&self) -> MutatorType {
-//         MutatorType::RandomByte
-//     }
-// }
+        self.mutator.next()
+    }
+}
 
-// impl Iterator for RandomByte<'_> {
-//     type Item = ();
+impl<T: Mutator> Mutator for WithTimeout<T> {
+    fn mutator_type(&self) -> MutatorType {
+        self.mutator.mutator_type()
+    }
 
-//     fn next(&mut self) -> Option<Self::Item> {
-//         // Revert previous mutation.
-//         if let Some(idx) = self.last_idx.take() {
-//             self.buffer[idx] = self.orig_byte;
-//         }
+    fn steps_total(&self) -> usize {
+        self.mutator.steps_total()
+    }
 
-//         if self.current_step == self.max_step {
-//             // No steps left
-//             return None;
-//         }
+    fn steps_done(&self) -> usize {
+        self.mutator.steps_done()
+    }
 
-//         // Mutate
-//         let mut rng = rand::thread_rng();
-//         self.last_idx = Some(rng.gen_range(0..self.buffer.len()));
-//         self.orig_byte = self.buffer[self.last_idx.unwrap()];
-//         let r8: u8 = rng.gen();
-//         self.buffer[self.last_idx.unwrap()] = self.buffer[self.last_idx.unwrap()] ^ r8;
+    fn needs_sync(&self) -> bool {
+        self.mutator.needs_sync()
+    }
 
-//         self.current_step += 1;
-//         Some(())
-//     }
-// }
+    fn one_shot(&self) -> bool {
+        self.mutator.one_shot()
+    }
 
-// impl Drop for RandomByte<'_> {
-//     fn drop(&mut self) {
-//         if let Some(idx) = self.last_idx.take() {
-//             self.buffer[idx] = self.orig_byte;
-//         }
-//     }
-// }
+    fn estimate_runtime(&self, avg_exec_time: Duration) -> Duration {
+        self.mutator.estimate_runtime(avg_exec_time)
+    }
+
+    fn steps_left(&self) -> usize {
+        self.mutator.steps_left()
+    }
+}
+
+pub struct RandomBit<'a, const N: usize> {
+    /// The buffer that is mutated.
+    buffer: &'a mut [u8],
+    /// Number of iterations we already performed.
+    current_step: usize,
+    /// Maximum number of iterations.
+    max_step: usize,
+    /// Index of the last byte we mutated.
+    last_idx: Option<usize>,
+    /// The original value of the byte that we mutated.
+    saved_byte: u8,
+}
+
+impl<const N: usize> RandomBit<'_, N> {
+    /// Create a new mutator. Returns None, if the backing buffer is smaller than N.
+    #[allow(unused)]
+    pub fn new(buffer: &mut [u8], steps: usize) -> RandomBit<N> {
+        assert!(N == 1, "Currently only 1 is supported for N");
+        RandomBit {
+            buffer,
+            current_step: 0,
+            max_step: steps,
+            last_idx: None,
+            saved_byte: 0,
+        }
+    }
+}
+
+impl<const N: usize> fmt::Debug for RandomBit<'_, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct(&format!("RandomBit{}", N))
+            .field("current_step", &self.current_step)
+            .field("max_step", &self.max_step)
+            .field("last_idx", &self.last_idx)
+            .field("saved_byte", &self.saved_byte)
+            .field("buffer.len()", &self.buffer.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<const N: usize> Mutator for RandomBit<'_, N> {
+    fn steps_total(&self) -> usize {
+        self.max_step
+    }
+
+    fn steps_done(&self) -> usize {
+        self.current_step
+    }
+
+    fn mutator_type(&self) -> MutatorType {
+        MutatorType::RandomBit(N)
+    }
+}
+
+impl<const N: usize> Iterator for RandomBit<'_, N> {
+    type Item = ();
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Revert previous mutation.
+        if let Some(idx) = self.last_idx.take() {
+            self.buffer[idx] = self.saved_byte;
+        }
+
+        if self.current_step == self.max_step {
+            // No steps left
+            return None;
+        }
+
+        // Mutate
+        let mut rng = rand::thread_rng();
+        let target_idx = rng.gen_range(0..(self.buffer.len()));
+        self.saved_byte = self.buffer[target_idx];
+        self.buffer[target_idx] ^= 1 << (rng.gen::<u8>() % 8);
+        self.last_idx = Some(target_idx);
+
+        self.current_step += 1;
+        Some(())
+    }
+}
+
+impl<const N: usize> Drop for RandomBit<'_, N> {
+    fn drop(&mut self) {
+        if let Some(idx) = self.last_idx.take() {
+            self.buffer[idx] = self.saved_byte;
+        }
+    }
+}
 
 /// A Mutator that replaces a byte at a random index with a random value.
 pub struct RandomByte<'a, const N: usize> {
@@ -543,7 +628,6 @@ impl Havoc<'_> {
     #[allow(unused)]
     pub fn new(buffer: &mut [u8], max_stacks: usize, repetitions: usize) -> Havoc {
         // save un-mutated buffer
-        // TODO: replace Vec?
         let mut orig_buffer: Vec<u8> = vec![0; buffer.len()];
         orig_buffer.copy_from_slice(buffer);
         let steps_total = max_stacks * repetitions;
@@ -576,7 +660,7 @@ impl Mutator for Havoc<'_> {
     }
 
     fn steps_done(&self) -> usize {
-        self.steps_done as usize
+        self.steps_done
     }
 
     fn mutator_type(&self) -> MutatorType {
@@ -593,7 +677,7 @@ impl Iterator for Havoc<'_> {
             self.buffer.copy_from_slice(&self.orig_buffer);
             return None;
         }
-        // revert previous mutations
+        // revert previous mutations if we stacked the maximum of mutations.
         if self.steps_done > 0 && self.steps_done % self.max_stacks == 0 {
             self.buffer.copy_from_slice(&self.orig_buffer);
         }
@@ -659,6 +743,11 @@ impl fmt::Debug for Nop {
 }
 
 impl Mutator for Nop {
+    fn needs_sync(&self) -> bool {
+        // Make sure that all effects of the previous mutator are reverted.
+        true
+    }
+
     fn steps_total(&self) -> usize {
         self.steps
     }
@@ -755,6 +844,7 @@ impl Iterator for CombineMutator<'_> {
             self.buffer[0..copy_len].copy_from_slice(&msk[0..copy_len]);
             Some(())
         } else {
+            self.buffer.copy_from_slice(&self.buffer_original[..]);
             None
         }
     }
@@ -763,6 +853,74 @@ impl Iterator for CombineMutator<'_> {
 impl Drop for CombineMutator<'_> {
     fn drop(&mut self) {
         self.buffer.copy_from_slice(&self.buffer_original[..]);
+    }
+}
+
+/// A Mutator that consecutively flips each byte.
+pub struct FlipOnce<'a> {
+    /// The mutated buffer.
+    buffer: &'a mut [u8],
+    done: bool,
+}
+
+impl FlipOnce<'_> {
+    #[allow(unused)]
+    pub fn new(buffer: &mut [u8]) -> FlipOnce {
+        let size = buffer.len();
+
+        FlipOnce {
+            buffer,
+            done: false,
+        }
+    }
+}
+
+impl fmt::Debug for FlipOnce<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlipOnce")
+            .field("buffer.len()", &self.buffer.len())
+            .finish()
+    }
+}
+
+impl Mutator for FlipOnce<'_> {
+    fn steps_total(&self) -> usize {
+        1
+    }
+
+    fn steps_done(&self) -> usize {
+        if self.done {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn mutator_type(&self) -> MutatorType {
+        MutatorType::FlipOnce
+    }
+}
+
+impl Iterator for FlipOnce<'_> {
+    type Item = ();
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        self.buffer.iter_mut().for_each(|b| *b = !*b);
+        self.done = true;
+        Some(())
+    }
+}
+
+impl Drop for FlipOnce<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            // Was already applied, so we need to revert it.
+            self.buffer.iter_mut().for_each(|b| *b = !*b);
+        }
     }
 }
 

@@ -1,5 +1,8 @@
-use fuzztruction_shared::types::PatchPointID;
+use chrono::Utc;
+use fuzztruction_shared::types::MutationSiteID;
 use hex::ToHex;
+
+use itertools::Itertools;
 
 use rand::prelude::{IteratorRandom, SliceRandom};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -11,7 +14,6 @@ use std::{
     fs::{self, OpenOptions},
     hash,
     io::Write,
-    mem,
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::{atomic::AtomicU64, Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -21,10 +23,14 @@ use std::{
 use anyhow::{Context, Result};
 use lazy_static::lazy_static;
 
-use crate::{sink_bitmap::Bitmap, trace::Trace};
+use crate::{
+    constants::{MAX_PATCHPOINT_CNT, MAX_QUEUE_DUMP_THREADS, MAX_QUEUE_ENTRY_CNT},
+    finite_integer_set::FiniteIntegerSet,
+    sink_bitmap::Bitmap,
+    trace::Trace,
+};
 
 use super::{
-    finite_integer_set::{PatchPointIDSet, QueueIDDSet},
     worker::WorkerUid,
     worker_impl::{FuzzingPhase, MutatorType},
 };
@@ -36,7 +42,10 @@ lazy_static! {
     /// Cache used to store all inputs we already saw.
     static ref INPUTS_CACHE: Mutex<HashMap<String, Arc<Input>>> = Mutex::new(HashMap::new());
 }
-const DEFAULT_FAVOURED_WEIGHT: u32 = 5;
+const DEFAULT_FAVOURED_WEIGHT: u32 = 3;
+
+pub type PatchPointIDSet = FiniteIntegerSet<MutationSiteID, MAX_PATCHPOINT_CNT>;
+pub type QueueIDDSet = FiniteIntegerSet<QueueEntryId, MAX_QUEUE_ENTRY_CNT>;
 
 /// A input passed to an application.
 #[derive(Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +228,7 @@ impl QueueEntryStats {
         });
         let selection = set.choose_random(max);
         set -= &selection;
+        log::debug!("Patch Points left for discovery {}", set.len());
         selection
     }
 
@@ -241,13 +251,7 @@ impl QueueEntryStats {
         self.favoured_weight.is_some()
     }
 
-    // pub fn set_favoured(&mut self, val: u32) {
-    //     assert!(val > 0);
-    //     assert!(self.favoured_weight().is_none());
-    //     self.favoured_weight = NonZeroU32::new(val);
-    // }
-
-    pub fn mark_favoured(&mut self) {
+    pub fn mark_favoured_once(&mut self) {
         if self.favoured_weight.is_none() {
             self.favoured_weight = NonZeroU32::new(DEFAULT_FAVOURED_WEIGHT)
         }
@@ -259,7 +263,7 @@ impl QueueEntryStats {
     }
 
     /// Decrement the `favoured_weight` by one, but never below 1.
-    pub fn favoured_weight_decrement(&mut self) {
+    pub fn favoured_decrement(&mut self) {
         self.favoured_weight = match self.favoured_weight {
             Some(old) if old.get() > 1 => NonZeroU32::new(old.get() - 1),
             old => old,
@@ -282,15 +286,15 @@ pub struct QueueEntry {
     /// The mutator that was used.
     mutator: Option<MutatorType>,
     /// The patch point that was mutated.
-    patch_point: Option<PatchPointID>,
+    patch_point: Option<MutationSiteID>,
     /// The finder of this entry.
     finder: Option<WorkerUid>,
     /// The Input that was used as input for the source application.
     input: Arc<Input>,
-    /// The Unix timestamp at which the QueueEntry was created.
-    creation_ts: chrono::DateTime<chrono::Utc>,
+    /// Creation timestamp relative to the start of the fuzzing run.
+    creation_ts_in_ms: Option<i64>,
     /// The mutations that need to be enabled to replay this QueueEntry.
-    #[serde(skip)]
+    // #[serde(skip)]
     mutations: Option<Vec<u8>>,
     /// The hash of the coverage bitmap of the sink.
     bitmap_hash32: u32,
@@ -305,6 +309,9 @@ pub struct QueueEntry {
     sink_unstable: bool,
     /// Number of ancestors.
     generation: usize,
+    /// Whether this is a queue entry that causes a crash of the consumer.
+    is_crash: bool,
+    pcap: Option<Vec<u8>>,
 }
 
 impl PartialEq for QueueEntry {
@@ -331,8 +338,9 @@ impl std::fmt::Debug for QueueEntry {
             .field("patch_point", &self.patch_point)
             .field("finder", &self.finder)
             .field("input", &self.input)
-            .field("creation_ts", &self.creation_ts)
+            .field("creation_ts_in_ms", &self.creation_ts_in_ms)
             .field("bitmap_hash32", &self.bitmap_hash32)
+            .field("#edges", &self.covered_edges().count_bits_set())
             .field("avg_exec_duration_raw", &self.avg_exec_duration_raw)
             .field("sink_unstable", &self.sink_unstable)
             .field("generation", &self.generation)
@@ -346,7 +354,6 @@ static QUEUE_ENTRY_NEXT_ID: AtomicU64 = AtomicU64::new(0);
 impl QueueEntry {
     pub fn new(
         input: Arc<Input>,
-        creation_ts: chrono::DateTime<chrono::Utc>,
         mutations: Option<&Vec<u8>>,
         bitmap_hash32: u32,
         avg_exec_duration_raw: Duration,
@@ -355,7 +362,9 @@ impl QueueEntry {
         finder: Option<WorkerUid>,
         phase: Option<FuzzingPhase>,
         mutator: Option<MutatorType>,
-        patch_point: Option<PatchPointID>,
+        patch_point: Option<MutationSiteID>,
+        is_crash: bool,
+        pcap: Option<Vec<u8>>,
     ) -> Self {
         let next_id = QUEUE_ENTRY_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let stats = QueueEntryStats {
@@ -374,7 +383,7 @@ impl QueueEntry {
             id: QueueEntryId(next_id),
             parent_id: None,
             input,
-            creation_ts,
+            creation_ts_in_ms: None,
             mutations: mutations.cloned(),
             bitmap_hash32,
             avg_exec_duration_raw,
@@ -386,6 +395,8 @@ impl QueueEntry {
             phase,
             mutator,
             patch_point,
+            is_crash,
+            pcap,
         }
     }
 
@@ -410,8 +421,12 @@ impl QueueEntry {
         self.input.as_ref()
     }
 
-    pub fn creation_ts(&self) -> chrono::DateTime<chrono::Utc> {
-        self.creation_ts
+    pub fn creation_ts(&self) -> Option<i64> {
+        self.creation_ts_in_ms
+    }
+
+    pub fn set_creation_ts(&mut self, ts: i64) {
+        self.creation_ts_in_ms.replace(ts);
     }
 
     pub fn mutations(&self) -> Option<&Vec<u8>> {
@@ -431,7 +446,7 @@ impl QueueEntry {
     }
 
     pub fn avg_exec_duration_raw_us(&self) -> u128 {
-        self.avg_exec_duration_raw.as_micros() as u128
+        self.avg_exec_duration_raw.as_micros()
     }
 
     pub fn sink_unstable(&self) -> bool {
@@ -462,7 +477,7 @@ impl QueueEntry {
         self.finder
     }
 
-    pub fn patch_point(&self) -> Option<PatchPointID> {
+    pub fn patch_point(&self) -> Option<MutationSiteID> {
         self.patch_point
     }
 
@@ -473,11 +488,20 @@ impl QueueEntry {
     pub fn mutator(&self) -> Option<MutatorType> {
         self.mutator
     }
+
+    pub fn is_crash(&self) -> bool {
+        self.is_crash
+    }
+
+    pub fn pcap(&self) -> &Option<Vec<u8>> {
+        &self.pcap
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Queue {
     entries: Vec<Arc<QueueEntry>>,
+    start_ts: chrono::DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -495,7 +519,14 @@ impl Iterator for QueueIterator {
 
 impl Queue {
     pub fn new() -> Queue {
-        Default::default()
+        Queue {
+            start_ts: chrono::Utc::now(),
+            ..Default::default()
+        }
+    }
+
+    pub fn start_ts(&self) -> chrono::DateTime<Utc> {
+        self.start_ts
     }
 
     /// Push a new QueueEntry to the queue.
@@ -571,49 +602,102 @@ impl Queue {
         }
     }
 
+    pub fn iter_without_crashes(&self) -> QueueIterator {
+        let mut entries = self.entries.clone();
+        entries.retain(|e| !e.is_crash());
+        QueueIterator { entries }
+    }
+
     /// Dump the queue into the directory `path`.
     pub fn dump(&self, path: &Path) -> Result<()> {
         log::info!("Dumping queue to {:?}", path);
         fs::create_dir_all(path)?;
 
-        self.entries().par_iter().for_each(|entry| {
-            let mut entry_path = path.to_owned();
-            entry_path.push(format!("{}.zlib", entry.id().0));
+        //let pool = rayon::ThreadPoolBuilder::new().num_threads(MAX_QUEUE_DUMP_THREADS).build().unwrap();
 
-            if entry_path.exists() {
-                // Was already dumped.
-            } else {
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .open(entry_path)
-                    .unwrap();
-                let mut compressor = ZlibEncoder::new(Vec::new(), Compression::default());
-                serde_json::to_writer_pretty(&mut compressor, &entry).unwrap();
-                let compressed_bytes = compressor.finish().unwrap();
-                file.write_all(&compressed_bytes).unwrap();
-            }
-        });
+        //pool.install(|| {
+            self.entries().par_iter().for_each(|entry| {
+                let mut entry_path = path.to_owned();
+                entry_path.push(format!("{}.zlib", entry.id().0));
+
+                if entry_path.exists() {
+                    // Was already dumped.
+                } else {
+                    let mut file = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .open(entry_path)
+                        .unwrap();
+                    let mut compressor = ZlibEncoder::new(Vec::new(), Compression::default());
+                    serde_json::to_writer_pretty(&mut compressor, &entry).unwrap();
+                    let compressed_bytes = compressor.finish().unwrap();
+                    file.write_all(&compressed_bytes).unwrap();
+                }
+            });
+        //});
+
         Ok(())
     }
 
-    pub fn load(path: &Path) -> Result<Queue> {
+    pub fn load(path: &Path, id_whitelist: Option<&[u64]>) -> Result<Queue> {
         let mut ret = Queue::new();
         let dir = fs::read_dir(path)?;
-        for entry in dir {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                let content = fs::read(entry.path())?;
+        let mut files = dir
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect_vec();
+
+        if let Some(id_whitelist) = id_whitelist {
+            files.retain(|path| {
+                id_whitelist.contains(
+                    &path
+                        .file_prefix()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+            })
+        }
+
+        let entries = files
+            .par_iter()
+            .map(|file| {
+                let content = fs::read(file).unwrap();
                 let mut decompressed = Vec::new();
                 let mut decompressor = ZlibDecoder::new(&mut decompressed);
                 decompressor.write_all(&content).unwrap();
                 decompressor.finish().unwrap();
 
-                let qe: QueueEntry = serde_json::from_slice(&decompressed)?;
-                log::debug!("QueueEntry size: {}", mem::size_of_val(&qe));
-                ret.push(&qe);
-            }
+                let qe: QueueEntry = serde_json::from_slice(&decompressed).unwrap();
+                qe
+            })
+            .collect::<Vec<_>>();
+
+        for entry in entries {
+            ret.push(&entry);
         }
+
         Ok(ret)
+    }
+
+    pub fn print_queue_stats(&self) {
+        let mut stage_yield_frequency = HashMap::new();
+        let mut mutator_yield_frequency = HashMap::new();
+        for entry in self.iter() {
+            stage_yield_frequency
+                .entry(entry.phase())
+                .and_modify(|e| *e += 1)
+                .or_insert(1);
+            mutator_yield_frequency
+                .entry(entry.mutator())
+                .and_modify(|e| *e += 1)
+                .or_insert(1);
+        }
+
+        log::info!("stage_yield_frequency={:#?}", stage_yield_frequency);
+        log::info!("mutator_yield_frequency={:#?}", mutator_yield_frequency);
     }
 }

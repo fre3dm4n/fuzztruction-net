@@ -2,9 +2,11 @@ use std::{cmp::min, mem, ptr};
 
 use log::warn;
 
-use crate::{mutation_cache_entry::MutationCacheEntry, types::PatchPointID};
+use crate::{
+    constants::MAX_MUTATION_CACHE_ENTRIES, mutation_cache_entry::MutationCacheEntry,
+    types::MutationSiteID,
+};
 
-const MAX_MUTATION_CACHE_ENTRIES: usize = 200000;
 const PENDING_DELETIONS_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Copy)]
@@ -12,7 +14,7 @@ struct EntryDescriptor {
     start_offset: usize,
 }
 
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Debug)]
 pub struct MutationCacheContent {
     /// Size of the memory region backing this instance (i.e., the memory &self points to).
@@ -21,8 +23,11 @@ pub struct MutationCacheContent {
     current_data_size: usize,
     /// The index of the next slot in entry_decriptor_tbl that is free.
     next_free_slot: usize,
-    ///
+    /// Entries that have been deleted but not removed.
     pending_deletions: usize,
+    /// Wether the data in the cache was changed in such a way that all pointers
+    /// into the cache handed out so far got invalidated and must be updated.
+    invalidate: bool,
     /// Descriptors describing the start and length of all `MutationCacheEntries`
     /// currently in the cache.
     entry_decriptor_tbl: [Option<EntryDescriptor>; MAX_MUTATION_CACHE_ENTRIES],
@@ -88,6 +93,7 @@ impl MutationCacheContent {
     }
 
     pub fn clear(&mut self) {
+        self.invalidate = true;
         self.current_data_size = 0;
         self.next_free_slot = 0;
         self.entry_decriptor_tbl.fill(None);
@@ -158,6 +164,7 @@ impl MutationCacheContent {
 
             self.current_data_size += entry.size();
             unsafe {
+                self.invalidate = true;
                 return Some(&*(dst_addr as *const MutationCacheEntry));
             };
         } else {
@@ -166,7 +173,13 @@ impl MutationCacheContent {
         }
     }
 
-    pub fn consolidate(&mut self) {
+    /// Remove gaps between MutationCacheEntry's that were caused by removal of
+    /// elements (since we store the entries in a simple array).
+    /// # Safety
+    /// This will invalidate all pointers into the cache. Thus, no pointers
+    /// handed out prior to this call are allowed to be used anymore.
+    pub unsafe fn consolidate(&mut self) {
+        self.invalidate = true;
         // Copy all entries currently contained in the cache.
         let entries = self
             .entries()
@@ -181,13 +194,18 @@ impl MutationCacheContent {
         });
     }
 
-    pub fn remove(&mut self, id: PatchPointID) {
+    /// Remove the MutationCacheEntry with the given `id`.
+    /// # Safety
+    /// This potentially causes the the cache to be consolidated and therefore
+    /// causes all pointers into the cache to be invalidate (see consolidate()).
+    pub unsafe fn remove(&mut self, id: MutationSiteID) {
         let mut descriptor = None;
         for (idx, d) in self.entry_decriptor_tbl.iter().enumerate() {
             if let Some(des @ EntryDescriptor { start_offset, .. }) = d {
                 let entry = unsafe { self.entry_ref(*start_offset as isize) };
                 if entry.id() == id {
                     descriptor = Some((idx, des.clone()));
+                    self.invalidate = true;
                     break;
                 }
             }
@@ -207,25 +225,36 @@ impl MutationCacheContent {
 
         unreachable!("Trying to delete entry {:?} that does not exists!", id);
     }
+
+    pub fn is_invalidated(&self) -> bool {
+        self.invalidate
+    }
+
+    pub fn clear_invalidated(&mut self) {
+        self.invalidate = false;
+    }
 }
 
 #[cfg(test)]
 mod test {
+    use llvm_stackmap::LLVMInstruction;
+
     use super::*;
     use crate::util;
     use std::assert_matches::assert_matches;
 
     fn dummy_entry(id: u64) -> Box<MutationCacheEntry> {
-        MutationCacheEntry::new(
-            id.into(),
-            0,
-            0,
-            llvm_stackmap::LocationType::Constant,
-            8,
-            crate::dwarf::DwarfReg::Rax,
-            0,
-            0,
-        )
+        unsafe {
+            MutationCacheEntry::new(
+                id.into(),
+                LLVMInstruction::Br,
+                0,
+                0,
+                mem::zeroed(),
+                mem::zeroed(),
+                0,
+            )
+        }
     }
 
     #[test]
@@ -250,13 +279,15 @@ mod test {
         let _ret = content.push(&e1).unwrap();
         assert_eq!(content.entries().len(), 2);
 
-        content.remove(e0.id());
-        assert_eq!(content.entries().len(), 1);
+        unsafe {
+            content.remove(e0.id());
+            assert_eq!(content.entries().len(), 1);
 
-        content.remove(e1.id());
-        assert_eq!(content.entries().len(), 0);
-        content.consolidate();
-        assert_eq!(content.space_left(), init_space_left);
+            content.remove(e1.id());
+            assert_eq!(content.entries().len(), 0);
+            content.consolidate();
+            assert_eq!(content.space_left(), init_space_left);
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 #![allow(unused)]
 
-use fuzztruction_shared::{mutation_cache::MutationCache, types::PatchPointID};
+use fuzztruction_shared::{mutation_cache::MutationCache, types::MutationSiteID};
 use std::{
     collections::{HashMap, HashSet},
     default, fmt,
@@ -16,7 +16,7 @@ use crate::{
         event_counter::FuzzerEventCounter,
         queue::{Queue, QueueEntry, QueueEntryId},
     },
-    patchpoint::PatchPoint,
+    mutation_site::MutationSite,
     trace::Trace,
 };
 
@@ -56,7 +56,7 @@ pub struct FuzzerConfiguration {
     entry: Arc<QueueEntry>,
     phase: FuzzingPhase,
     mutator: MutatorType,
-    target_pp_id: PatchPointID,
+    target_pp_id: MutationSiteID,
     counter: FuzzerEventCounter,
 }
 
@@ -75,7 +75,7 @@ impl FuzzerConfiguration {
         entry: Arc<QueueEntry>,
         phase: FuzzingPhase,
         mutator: MutatorType,
-        target_pp_id: PatchPointID,
+        target_pp_id: MutationSiteID,
         iterations: usize,
         counter: &FuzzerEventCounter,
     ) -> Self {
@@ -98,9 +98,9 @@ impl FuzzerConfiguration {
 #[allow(clippy::type_complexity)]
 #[derive(Debug)]
 pub struct Cerebrum {
-    pub(super) patch_points: HashSet<Arc<PatchPoint>>,
-    pub(super) patch_point_stats: HashMap<PatchPointID, PatchPointStatsEntry>,
-    pub(super) patch_point_msks: HashMap<PatchPointID, Vec<(QueueEntryId, Arc<[u8]>)>>,
+    pub(super) patch_points: HashSet<Arc<MutationSite>>,
+    pub(super) patch_point_stats: HashMap<MutationSiteID, PatchPointStatsEntry>,
+    pub(super) patch_point_msks: HashMap<MutationSiteID, Vec<(QueueEntryId, Arc<[u8]>)>>,
     pub(super) active_configuration: Option<FuzzerConfiguration>,
     pub(super) queue: Arc<Mutex<Queue>>,
     // replace usize with struct?
@@ -108,7 +108,7 @@ pub struct Cerebrum {
 }
 
 impl Cerebrum {
-    pub fn new(patch_points: &[PatchPoint], queue: Arc<Mutex<Queue>>) -> Cerebrum {
+    pub fn new(patch_points: &[MutationSite], queue: Arc<Mutex<Queue>>) -> Cerebrum {
         let patch_points = patch_points
             .iter()
             .cloned()
@@ -132,7 +132,7 @@ impl Cerebrum {
         CerebrumQuery::new(self)
     }
 
-    pub(super) fn resolve_pp_id(&self, id: PatchPointID) -> Arc<PatchPoint> {
+    pub(super) fn resolve_pp_id(&self, id: MutationSiteID) -> Arc<MutationSite> {
         self.patch_points
             .iter()
             .find(|e| e.id() == id)
@@ -140,7 +140,7 @@ impl Cerebrum {
             .unwrap()
     }
 
-    pub(super) fn pp_stats(&self, id: PatchPointID) -> &PatchPointStatsEntry {
+    pub(super) fn pp_stats(&self, id: MutationSiteID) -> &PatchPointStatsEntry {
         self.patch_point_stats.get(&id).unwrap()
     }
 
@@ -153,10 +153,7 @@ impl Cerebrum {
             for mc_entry in mc.entries() {
                 let value = self.patch_point_stats.get_mut(&mc_entry.id()).unwrap();
                 value.used_by.insert(qe.id());
-                let key = self
-                    .patch_point_msks
-                    .entry(mc_entry.id())
-                    .or_insert_with(Vec::new);
+                let key = self.patch_point_msks.entry(mc_entry.id()).or_default();
                 if key
                     .iter()
                     .all(|entry| entry.1.as_ref() != mc_entry.get_msk_as_slice())

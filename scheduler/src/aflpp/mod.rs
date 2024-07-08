@@ -7,8 +7,3 @@ pub enum WorkerId {
     WeizzMaster,
     WeizzWorker(usize),
 }
-
-mod aflpp_core;
-mod symcc;
-mod weizz;
-pub use aflpp_core::run_aflpp_mode;

@@ -47,7 +47,7 @@ else
     log_success "[+] Using locally build image"
     mounts+=" -v $PWD:/home/user/fuzztruction "
 fi
-mounts+=" -v $PWD:/home/user/shared "
+mounts+=" -v $PWD:/shared "
 
 cmd="docker run -ti -d --privileged
     $mounts
@@ -59,13 +59,13 @@ cmd="docker run -ti -d --privileged
     -v $PWD/data/vscode-data:/home/user/.config/Code
     --mount type=tmpfs,destination=/tmp,tmpfs-mode=777
     --ulimit msgqueue=2097152000
-    --shm-size=16G
+    --shm-size=64G
     --net=host
     --name $CONTAINER_NAME
     --env "PREBUILT_ENV_VAR_NAME=$PREBUILT_ENV_VAR_NAME"
     --env "$PREBUILT_ENV_VAR_NAME=${!PREBUILT_ENV_VAR_NAME:-}" "
 
-if [[ ! -z "$SSH_AUTH_SOCK"  ]]; then
+if [[ ! -z "${SSH_AUTH_SOCK:-}"  ]]; then
     log_success "[+] Forwarding ssh agent ($SSH_AUTH_SOCK -> /ssh-agent)"
     cmd+="-v $(readlink -f "$SSH_AUTH_SOCK"):/ssh-agent --env SSH_AUTH_SOCK=/ssh-agent"
 fi

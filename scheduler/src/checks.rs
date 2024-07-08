@@ -1,9 +1,31 @@
-use std::{fs::read_to_string, process::Command};
+use std::{
+    fs::{self, read_to_string},
+    process::Command,
+};
 
 use anyhow::{anyhow, Context, Result};
 use jail::jail::wrap_libc;
+use nix::{
+    sys::{
+        resource::{getrlimit, setrlimit, Resource},
+        stat::{umask, Mode},
+    },
+    unistd::Uid,
+};
 
 use crate::{config::Config, error::CliError, fuzzer::queue::Input};
+
+fn check_perf_event_paranoid() -> Result<()> {
+    let content = read_to_string("/proc/sys/kernel/perf_event_paranoid");
+    let content = content.expect("Failed to open /proc/sys/kernel/perf_event_paranoid");
+    let level = content.trim().parse::<i32>().unwrap();
+    if level > 1 {
+        return Err(anyhow!(
+            "Please run\necho 1 | sudo tee /proc/sys/kernel/perf_event_paranoid"
+        ));
+    }
+    Ok(())
+}
 
 /// Check whether core_pattern is not set to 'core'. If this is the case, we need
 /// to pay the overhead of creating a core image each time we crash during an execution.
@@ -73,9 +95,36 @@ fn check_if_agent_is_in_path() -> Result<()> {
                 .to_owned();
         msg.push_str("echo '/home/user/leah/target/debug' > /etc/ld.so.conf.d/fuzztruction.conf\n");
         msg.push_str("sudo ldconfig");
-        return Err(CliError::ConfigurationError(format!("{:#?}", output))).context(msg)?;
+        Err(CliError::ConfigurationError(format!("{:#?}", output))).context(msg)?;
     }
 
+    Ok(())
+}
+
+fn check_scaling_governor() -> Result<()> {
+    let governor = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")?;
+    if governor.trim() != "performance" {
+        return Err(anyhow!("Please run echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"));
+    }
+    Ok(())
+}
+
+fn check_file_limit() -> Result<()> {
+    let (soft_limit, hard_limit) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+    if soft_limit < hard_limit {
+        log::info!("Increasing RLIMIT_NOFILE to {hard_limit}");
+        setrlimit(Resource::RLIMIT_NOFILE, hard_limit, hard_limit).unwrap();
+    }
+
+    Ok(())
+}
+
+fn check_mqueue_queues_max() -> Result<()> {
+    let procfs_file = "/proc/sys/fs/mqueue/queues_max";
+    let limit: u64 = fs::read_to_string(procfs_file)?.trim().parse().unwrap();
+    if limit < 1024 {
+        fs::write(procfs_file, "1024").unwrap();
+    }
     Ok(())
 }
 
@@ -85,6 +134,10 @@ pub fn check_system() -> Result<()> {
     check_fs_suid_dumpable()?;
     check_if_tmp_is_tmpfs()?;
     check_if_agent_is_in_path()?;
+    check_scaling_governor()?;
+    check_perf_event_paranoid()?;
+    check_file_limit()?;
+    check_mqueue_queues_max()?;
     Ok(())
 }
 
@@ -106,6 +159,13 @@ fn check_jail(config: &Config) -> Result<()> {
             }
         }
     }
+    if let Err(err) = nix::unistd::setuid(Uid::from_raw(0)) {
+        return Err(anyhow!("Failed to set UID to 0: {err:#?}"));
+    }
+
+    log::info!("Changeing umask to 0o000");
+    umask(Mode::empty());
+
     Ok(())
 }
 

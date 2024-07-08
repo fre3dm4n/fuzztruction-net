@@ -1,7 +1,13 @@
 use std::collections::HashMap;
 
 use crate::{
-    fuzzer::{worker::FuzzingWorker, worker_impl::mutators},
+    fuzzer::{
+        worker::FuzzingWorker,
+        worker_impl::{
+            mutators::{self},
+            phases::inject_debug_mutator,
+        },
+    },
     mutation_cache_ops::MutationCacheOpsEx,
 };
 
@@ -9,6 +15,7 @@ use anyhow::Result;
 use fuzztruction_shared::{
     mutation_cache::MutationCache, mutation_cache_entry::MutationCacheEntry,
 };
+use itertools::Itertools;
 use rand::{prelude::SliceRandom, thread_rng};
 
 use super::FuzzingPhase;
@@ -20,7 +27,6 @@ impl FuzzingWorker {
         self.state.set_phase(PHASE);
 
         let qe = self.state.entry();
-        self.load_queue_entry_mutations(&qe)?;
         let source = self.source.as_mut().unwrap();
 
         // MutationCache of the currently loaded QueueEntry.
@@ -32,7 +38,10 @@ impl FuzzingWorker {
         let entry_trace = qe.stats_ro().trace().unwrap();
 
         let mut tmp_mc = MutationCache::from_patchpoints(all_patch_points.iter())?;
-        tmp_mc.union_and_replace(&entry_mc_borrow);
+        unsafe {
+            // Safety: `tmp_mc` is newly crated and we do not have pointers into it.
+            tmp_mc.union_and_replace(&entry_mc_borrow);
+        }
         drop(entry_mc_borrow);
 
         unsafe {
@@ -58,9 +67,13 @@ impl FuzzingWorker {
         // Keep MCEs if we have a msk to try or if they have a non zero msk.
         candidates.retain(|entry| !entry.is_nop() || mce_to_msks.contains_key(&entry.id()));
 
+        let candidates = candidates.into_iter().take(100).collect_vec();
+
         // Create MC that only contains those MCEs for that we have msks to try.
         let new_mc = MutationCache::from_iter(candidates.into_iter())?;
-        source.mutation_cache_replace(&new_mc)?;
+        unsafe {
+            source.mutation_cache_replace(&new_mc)?;
+        }
         let mut entries = source.mutation_cache().borrow_mut().entries_mut_static();
         entries.shuffle(&mut thread_rng());
 
@@ -86,6 +99,7 @@ impl FuzzingWorker {
             let mutator =
                 mutators::CombineMutator::new(entry.get_msk_as_slice(), msks, entry.is_nop());
             mutators.push(Box::new(mutator) as Box<dyn mutators::Mutator<Item = ()>>);
+            inject_debug_mutator(&mut mutators);
 
             let entry = (unsafe { entry.alias_mut() }, mutators);
             mutations.push(entry);

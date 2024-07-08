@@ -3,14 +3,15 @@ use std::time::Duration;
 use fuzztruction_shared::{
     mutation_cache::MutationCache, mutation_cache_entry::MutationCacheEntry,
 };
-use rand::prelude::SliceRandom;
+use llvm_stackmap::LLVMInstruction;
+use rand::{prelude::SliceRandom, thread_rng};
 
 use crate::{
     fuzzer::{
         worker::FuzzingWorker,
         worker_impl::{
-            mutators::{self, Mutator},
-            phases::FuzzingPhase,
+            mutators::{self},
+            phases::{inject_debug_mutator, FuzzingPhase},
         },
     },
     mutation_cache_ops::MutationCacheOpsEx,
@@ -58,7 +59,6 @@ impl FuzzingWorker {
         self.state.set_phase(PHASE);
 
         let entry = self.state.entry();
-        self.load_queue_entry_mutations(&entry)?;
         let trace = entry.stats_ro().trace().unwrap();
         let source = self.source.as_mut().unwrap();
 
@@ -79,11 +79,10 @@ impl FuzzingWorker {
         unsafe {
             new_mc.remove_uncovered(&trace);
             new_mc.resize_covered_entries(&trace);
+            new_mc.union_and_replace(&source.mutation_cache().borrow());
+            source.mutation_cache_replace(&new_mc)?;
         }
-        //new_mc.retain(|e| e.msk_len() <= 64);
 
-        new_mc.union_and_replace(&source.mutation_cache().borrow());
-        source.mutation_cache_replace(&new_mc)?;
         let mut candidates = source.mutation_cache().borrow_mut().entries_mut_static();
         candidates.shuffle(&mut rand::thread_rng());
 
@@ -95,24 +94,45 @@ impl FuzzingWorker {
 
         for candidate in candidates.into_iter() {
             let mut mutators = Vec::new();
+            let msk_len = candidate.get_msk_as_slice().len();
 
-            let mutator = mutators::FlipByte::new(candidate.get_msk_as_slice());
+            // if matches!(
+            //     candidate.llvm_instruction(),
+            //     LLVMInstruction::Call | LLVMInstruction::Br
+            // ) {
+            //     let mutator = mutators::WithTimeout::new(
+            //         mutators::FlipBit::new(&mut candidate.get_msk_as_slice()[0..1]),
+            //         Duration::from_secs(60),
+            //     );
+            //     mutators.push(Box::new(mutator) as Box<dyn mutators::Mutator<Item = ()>>);
+            //     inject_debug_mutator(&mut mutators);
+            // }
+
+            // if let LLVMInstruction::InjectedCall = candidate.llvm_instruction() {
+            //     let mutator = mutators::WithTimeout::new(
+            //         mutators::U8Counter::new(&mut candidate.get_msk_as_slice()[0..1]),
+            //         Duration::from_secs(60),
+            //     );
+            //     mutators.push(Box::new(mutator) as Box<dyn mutators::Mutator<Item = ()>>);
+            //     inject_debug_mutator(&mut mutators);
+            // } else {
+            //     let mutator = mutators::FlipOnce::new(candidate.get_msk_as_slice());
+            //     mutators.push(Box::new(mutator) as Box<dyn mutators::Mutator<Item = ()>>);
+            //     inject_debug_mutator(&mut mutators);
+            // }
+
+            let mutator = mutators::FlipOnce::new(candidate.get_msk_as_slice());
             mutators.push(Box::new(mutator) as Box<dyn mutators::Mutator<Item = ()>>);
+            inject_debug_mutator(&mut mutators);
 
-            let u8_mutator = mutators::U8Counter::new(candidate.get_msk_as_slice());
-            if u8_mutator.estimate_runtime(self.state.entry().as_ref().avg_exec_duration_raw())
-                < Duration::from_secs(1)
-            {
-                mutators.push(Box::new(u8_mutator) as Box<dyn mutators::Mutator<Item = ()>>);
-            } else {
-                let mutator = mutators::FlipBit::new(candidate.get_msk_as_slice());
-                if mutator.estimate_runtime(self.state.entry().as_ref().avg_exec_duration_raw())
-                    < Duration::from_secs(1)
-                {
-                    mutators.push(Box::new(mutator) as Box<dyn mutators::Mutator<Item = ()>>);
-                }
+            let mutator = mutators::RandomByte1::new(candidate.get_msk_as_slice(), msk_len * 1);
+            if let Some(mutator) = mutator {
+                let timeout_mutator = mutators::WithTimeout::new(mutator, Duration::from_secs(60));
+                mutators.push(Box::new(timeout_mutator) as Box<dyn mutators::Mutator<Item = ()>>);
+                inject_debug_mutator(&mut mutators);
             }
 
+            mutators.shuffle(&mut thread_rng());
             let entry = (unsafe { candidate.alias_mut() }, mutators);
             mutations.push(entry);
         }

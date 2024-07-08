@@ -2,6 +2,7 @@ use fuzztruction_shared::constants::PATCH_POINT_SIZE;
 use hex::ToHex;
 use scheduler::{
     config::Config,
+    constants::DEFAULT_CALIBRATION_TIMEOUT,
     fuzzer::queue::Input,
     mutation_cache::{MutationCache, MutationCacheEntryFlags},
     mutation_cache_ops::MutationCacheOpsEx,
@@ -17,17 +18,19 @@ pub fn run(config: &Config, with_mutations: bool) {
     let first_input_bytes = first_input.data();
 
     let mut source_output = Vec::new();
-    let mut source = Source::from_config(config, None).unwrap();
+    let mut source = Source::from_config(config, None, None).unwrap();
     source.start().unwrap();
 
     let patch_points = source.get_patchpoints().unwrap();
     log::info!("#Patch Points with libraries : {}", patch_points.len());
 
     let mc = MutationCache::from_patchpoints(patch_points.iter()).unwrap();
-    source.mutation_cache_replace(&mc).unwrap();
+    unsafe {
+        source.mutation_cache_replace(&mc).unwrap();
+    }
 
     source.write(first_input_bytes);
-    let run_res = source.run(config.general.timeout).unwrap();
+    let run_res = source.run(DEFAULT_CALIBRATION_TIMEOUT).unwrap();
     log::info!("RunResult with all patchpoints disabled: {:?}", run_res);
 
     log::info!(
@@ -87,11 +90,6 @@ pub fn run(config: &Config, with_mutations: bool) {
         log::info!("Testing entry {} of {}", idx, mc_len);
         log::info!("entry={:#?} @ vma=0x{:x}", entry, entry.vma());
 
-        if config.general.jail_enabled() {
-            // acquire privileges, thus we are able to read the targets process memory.
-            jail::acquire_privileges().unwrap();
-        }
-
         let mem_old = source
             .read_mem(entry.vma() as usize, PATCH_POINT_SIZE)
             .unwrap();
@@ -102,11 +100,6 @@ pub fn run(config: &Config, with_mutations: bool) {
             .read_mem(entry.vma() as usize, PATCH_POINT_SIZE)
             .unwrap();
         let new_mem: String = new_mem.encode_hex();
-
-        let uid_gid = config.general.jail_uid_gid();
-        if let Some((uid, gid)) = uid_gid {
-            jail::drop_privileges(uid, gid, false).unwrap();
-        }
 
         source.write(first_input_bytes);
         let run_res = source.run(config.general.tracing_timeout).unwrap();

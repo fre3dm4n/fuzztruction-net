@@ -1,9 +1,11 @@
 //! Functions related to logging.
 
+use byte_unit::n_mib_bytes;
 use fern::colors::{Color, ColoredLevelConfig};
+use file_rotate::{compression::Compression, suffix::AppendCount, ContentLimit, FileRotate};
 use log::{self};
 use std::{
-    fs, panic,
+    panic,
     path::{Path, PathBuf},
     process,
     str::FromStr,
@@ -15,8 +17,14 @@ use anyhow::{Context, Result};
 /// Setup the global logger and only log messages of level `log_level`
 /// or higher.
 pub fn setup_logger(log_path: &Path, log_level: &str) -> Result<()> {
-    let mut options = fs::OpenOptions::new();
-    let log_file = options.create(true).truncate(true).write(true).read(true);
+    let rotating_log_file = FileRotate::new(
+        log_path,
+        AppendCount::new(5),
+        ContentLimit::BytesSurpassed(n_mib_bytes!(256).try_into().unwrap()),
+        Compression::None,
+        #[cfg(unix)]
+        None,
+    );
 
     fern::Dispatch::new()
         .format(|out, message, record| {
@@ -35,7 +43,7 @@ pub fn setup_logger(log_path: &Path, log_level: &str) -> Result<()> {
 
                 out.finish(format_args!(
                     "{}[{}][{:#?}][{}:{}][{}] {}",
-                    chrono::Local::now().format("[%Y-%m-%d %H:%M:%S]"),
+                    chrono::Local::now().format("[%Y-%m-%d %H:%M:%S:%f]"),
                     record.target().split("::").next().unwrap_or("?"),
                     unsafe { libc::gettid() },
                     record
@@ -61,7 +69,7 @@ pub fn setup_logger(log_path: &Path, log_level: &str) -> Result<()> {
                 .context(format!("'{}' is not a valid log level", log_level))?,
         )
         .chain(std::io::stdout())
-        .chain(log_file.open(log_path)?)
+        .chain(fern::Output::writer(Box::new(rotating_log_file), "\n"))
         .apply()?;
     Ok(())
 }

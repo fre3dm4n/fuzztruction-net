@@ -5,11 +5,9 @@
 #![feature(exclusive_range_pattern)]
 
 pub mod abi;
-pub mod alarm_timer;
 pub mod communication_channel;
 pub mod dwarf;
 pub mod messages;
-//pub mod mutation_cache;
 pub mod mutation_cache;
 pub mod mutation_cache_content;
 pub mod mutation_cache_entry;

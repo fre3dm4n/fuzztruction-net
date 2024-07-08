@@ -153,7 +153,7 @@ Switch into the `fuzztruction-experiments/comparison-with-state-of-the-art/binar
 ### **Benchmarking the Target**
 Using the following command
 ```bash
-sudo ./target/debug/fuzztruction fuzztruction-experiments/comparison-with-state-of-the-art/configurations/pngtopng_pngtopng/pngtopng-pngtopng.yml  --purge --show-output benchmark -i 100
+sudo ./target/debug/fuzztruction fuzztruction-experiments/comparison-with-state-of-the-art/configurations/pngtopng_pngtopng/pngtopng-pngtopng.yml  --purge --log-output benchmark -i 100
 ```
 allows testing whether the target works. Each target is defined using a `YAML` configuration file. The files are located in the `configurations` directory and are a good starting point for building your own config. The `pngtopng-pngtopng.yml` file is extensively documented.
 
@@ -161,7 +161,7 @@ allows testing whether the target works. Each target is defined using a `YAML` c
 ### **Troubleshooting**
 If the fuzzer terminates with an error, there are multiple ways to assist your debugging efforts.
 
-- Passing `--show-output` to `fuzztruction` allows you to observe stdout/stderr of the generator and the consumer if they are not used for passing or reading data from each other.
+- Passing `--log-output` to `fuzztruction` causes stdout/stderr of the generator and the consumer if they are not used for passing or reading data from each other to be written into files in the working directory.
 - Setting AFL_DEBUG in the `env` section of the `sink` in the `YAML` config can give you a more detailed output regarding the consumer.
 - Executing the generator and consumer using the same flags as in the config file might reveal any typo in the command line used to execute the application. In the case of using `LD_PRELOAD`, double check the provided paths.
 

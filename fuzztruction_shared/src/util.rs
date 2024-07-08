@@ -1,5 +1,9 @@
+use anyhow::{anyhow, Context, Result};
 use log::log_enabled;
-use nix::sys::signal::Signal;
+use nix::{
+    sys::signal::Signal,
+    unistd::{close, Pid},
+};
 use std::{
     alloc,
     convert::TryInto,
@@ -10,6 +14,7 @@ use std::{
     thread,
     time::Duration,
 };
+use syscalls::{syscall, syscall2, Sysno};
 
 pub trait ExpectNone {
     /// Whether this value is None.
@@ -83,6 +88,32 @@ pub fn current_log_level() -> log::Level {
     }
 }
 
+pub fn wait_pid_timeout(
+    pid: i32,
+    timeout: Option<Duration>,
+) -> Result<Option<nix::sys::wait::WaitStatus>> {
+    let fd: i32 = match unsafe { syscall2(Sysno::pidfd_open, pid.try_into().unwrap(), 0) } {
+        Ok(fd) => fd.try_into().unwrap(),
+        err @ Err(_) => return Err(anyhow!("Error while calling pidfd_open: {:?}", err)),
+    };
+
+    let _fd_guard = scopeguard::guard(fd, |v| close(v).unwrap());
+
+    let mut pollable_fds = vec![filedescriptor::pollfd {
+        fd: fd.try_into().unwrap(),
+        events: filedescriptor::POLLIN,
+        revents: 0,
+    }];
+
+    match filedescriptor::poll(&mut pollable_fds, timeout) {
+        Ok(_) => {
+            let wait_status = nix::sys::wait::waitpid(Pid::from_raw(pid), None)?;
+            Ok(Some(wait_status))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 pub fn try_get_child_exit_reason(pid: i32) -> Option<(Option<i32>, Option<Signal>)> {
     let status: libc::c_int = 0;
     let ret = unsafe {
@@ -120,6 +151,8 @@ pub fn interruptable_sleep(duration: Duration, interrupt_signal: &Arc<AtomicBool
     thread::sleep(duration_left);
     false
 }
+
+pub const DEBUG_CHECKS_ENABLED: bool = cfg!(debug_assertions);
 
 #[cfg(test)]
 mod test {

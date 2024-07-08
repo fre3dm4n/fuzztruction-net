@@ -104,8 +104,19 @@ unsetopt hist_save_by_copy
 setopt inc_append_history
 
 #export PATH="/llvm/bin:/usr/lib/ccache:$PATH"
-export PATH="/usr/lib/ccache:$PATH"
+#export PATH="/usr/lib/ccache:$PATH"
+
+function check_cwd() {
+    cwd="$(readlink -f /proc/self/cwd)"
+    if echo "$cwd" | grep -q "deleted"; then
+        if [[ -d "$PWD" ]]; then
+            cd "$PWD"
+        fi
+    fi
+}
+
+autoload -Uz add-zsh-hook
+add-zsh-hook preexec check_cwd
 
 alias c="cargo"
-
 /usr/bin/check_env.sh

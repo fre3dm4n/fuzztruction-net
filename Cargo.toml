@@ -1,19 +1,35 @@
+[profile.dev]
+opt-level = 3
+
+
 [patch.crates-io]
+# We need patches for this one that are not interesting for upstream, thus this is part of this repo itself.
 proc-maps = { path = "lib/proc-maps" }
 
 [workspace]
+resolver = "2"
 members = [
     "fuzztruction_shared",
     "scheduler",
     "generator/agent",
     "lib/proc-maps",
     "lib/jail",
-    "lib/compute_coverage"
+    "lib/compute_coverage",
 ]
 
 exclude = [
-    "lib/llvm-stackmap-rs"
+    "lib/llvm-stackmap-rs",
+    "lib/llvm-cov-json"
 ]
 
-[profile.dev]
-opt-level = 3
+[workspace.dependencies]
+anyhow = "1.0.71"
+thiserror = "1.0.40"
+lazy_static = "1.4.0"
+#ipc-channel = "0.16.0"
+serde = { version="1.0.163", features = ["derive"] }
+repr-trait = "1.0.0"
+log = { version = "0.4.17", features = ["release_max_level_debug", "kv_unstable", "serde"] }
+parking_lot = "0.12.1"
+byte-unit = "4.0.19"
+llvm_stackmap = "0.1.5"

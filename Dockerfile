@@ -1,35 +1,32 @@
-ARG PREBUILT_LLVM_IMAGE=nbars/fuzztruction-llvm_debug:11.0.1
+# ARG PREBUILT_LLVM_IMAGE=nbars/fuzztruction-llvm_debug:eb1d5065c560b3468fa0d34af3103359cd78c088
+ARG PREBUILT_LLVM_IMAGE=nbars/fuzztruction-llvm_debug:llvmorg-17.0.6
+
 FROM ${PREBUILT_LLVM_IMAGE} as llvm
 
-FROM ubuntu:20.04 as dev
+FROM ubuntu:23.04 as dev
 ENV DEBIAN_FRONTEND noninteractive
-ENV CCACHE_DIR=/ccache
-ENV CCACHE_MAXSIZE=25G
+# ENV CCACHE_DIR=/ccache
+# ENV CCACHE_MAXSIZE=25G
 
 RUN sed -i "s/^# deb-src/deb-src/g" /etc/apt/sources.list
 
 RUN apt update -y && yes | unminimize && apt-mark hold "llvm-*" && apt-mark hold "clang-*"
 RUN \
-    apt update -y && apt install -y build-essential git cmake binutils-gold gosu sudo valgrind python3-pip wget \
-    bison flex \
-    zsh powerline fonts-powerline iputils-ping iproute2 ripgrep \
-    libglib2.0-dev libfdt-dev libpixman-1-dev zlib1g-dev \
-    ccache locales rr htop strace ltrace tree nasm \
-    lsb-release ubuntu-dbgsym-keyring texinfo \
-    neovim bear ccache locales rr htop strace \
-    ltrace tree nasm lsb-release ubuntu-dbgsym-keyring gcc-multilib \
-    linux-tools-generic \
-    curl ninja-build xdot aspell-en neovim libgmp-dev tmux \
-    man psmisc lsof rsync zip unzip qpdf ncdu fdupes parallel \
-    texlive texlive-latex-extra texlive-fonts-recommended dvipng cm-super \
-    virtualenv python2 g++ libz3-dev zlib1g-dev libc++-dev mercurial nano
+    apt update -y && \
+    apt install -y aspell-en bear binutils-gold bison build-essential cm-super \
+        cmake curl dvipng fdupes flex fonts-powerline g++ gcc-multilib git gosu htop \
+        iproute2 iputils-ping libc++-dev libfdt-dev libglib2.0-dev libgmp-dev \
+        libpixman-1-dev libz3-dev linux-tools-generic locales lsb-release lsof libssl-dev libtool \
+        ltrace man mercurial nano nasm ncdu neovim ninja-build parallel powerline \
+        psmisc python3-pip qpdf ripgrep rr rsync strace sudo texinfo texlive \
+        texlive-fonts-recommended texlive-latex-extra tmux tree ubuntu-dbgsym-keyring \
+        unzip valgrind virtualenv wget xdot zip zlib1g-dev zsh \
+        graphviz-dev libcap-dev tcpflow gnutls-dev tcpdump graphviz-dev jq netcat-traditional python3.11-venv \
+        elfutils zstd pax-utils
 
-RUN sudo pip3 install mypy pylint matplotlib pyelftools lit pyyaml psutil
-
+RUN sudo pip3 install --break-system-packages mypy pylint matplotlib pyelftools lit pyyaml psutil pypcapkit awscli
 
 # Copy prebuilt custom LLVM version
-# By default nbars/fuzztruction-llvm_debug:11.0.1
-# DIGEST:sha256:56e1b3c584f82ce645ce5f7a32765a82ca82a6c5c23bed988d30d2d6cd187281
 COPY --from=llvm /llvm/* /usr
 
 RUN locale-gen en_US.UTF-8
@@ -44,15 +41,27 @@ RUN update-locale LANG=en_US.UTF-8
 ENV LANG=en_US.UTF-8
 
 # Install AFL++
-RUN git clone https://github.com/AFLplusplus/AFLplusplus -b 4.00c && cd AFLplusplus && make all && make install
+COPY consumer /consumer
+RUN cd /consumer/aflpp-consumer && make clean && make all && make install
 
 # Make sure the loader finds our agent library.
 COPY data/ld_fuzztruction.conf /etc/ld.so.conf.d/fuzztruction.conf
 
-#Create user "user"
-RUN groupadd -g ${USER_GID} user
+#Create group "user" or if there is a group with id USER_GID rename it to user.
+RUN groupadd -g ${USER_GID} user || groupmod -g ${USER_GID} -n user $(getent group ${USER_GID} | cut -d: -f1)
+
+#Create user "user" or if there is a use with id USER_UID rename it to user.
 # -l -> https://github.com/moby/moby/issues/5419
-RUN useradd -l --shell /bin/bash -c "" -m -u ${USER_UID} -g user -G sudo user
+RUN useradd -l --shell /bin/bash -c "" -m -u ${USER_UID} -g user -G sudo user || usermod -u ${USER_UID} -l user $(id -nu ${USER_UID})
+
+# If we renamed an existing user, we need to make sure that its home directory is updated and owned by us.
+RUN mkdir -p /home/user && \
+    usermod -d /home/user user && \
+    chown -R user:user /home/user
+
+RUN gpasswd -a user user
+RUN gpasswd -a user sudo
+
 WORKDIR "/home/user"
 
 RUN echo "set speller \"aspell -x -c\"" > /etc/nanorc
@@ -67,78 +76,87 @@ RUN cd /tmp && \
     make check && \
     make install
 
+COPY env/check_env.sh /usr/bin/
+
+# depot tools needed for webrtc()
+RUN cd / && git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+ENV PATH "$PATH:/depot_tools"
+RUN chown user:user -R /depot_tools
+
 USER user
-RUN wget -O ~/.gdbinit-gef.py -q https://gef.blah.cat/py \
-  && echo source ~/.gdbinit-gef.py >> ~/.gdbinit
+#RUN wget -O ~/.gdbinit-gef.py -q https://gef.blah.cat/py \
+COPY lib/gdbinit-gef.py ~/.gdbinit-gef.py
+RUN echo source ~/.gdbinit-gef.py >> ~/.gdbinit
 
 # Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y --default-toolchain nightly-2022-09-06
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y --default-toolchain nightly-2023-10-10
 ENV PATH="/home/user/.cargo/bin:${PATH}"
 
-RUN sh -c "$(wget -O- https://raw.githubusercontent.com/deluan/zsh-in-docker/master/zsh-in-docker.sh)" -- \
+RUN cd /tmp && \
+    sh -c "$(wget -O- https://raw.githubusercontent.com/deluan/zsh-in-docker/master/zsh-in-docker.sh)" -- \
     -t agnoster
 
-# Install DynamoRIO
-RUN  wget https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-9.0.19078/DynamoRIO-Linux-9.0.19078.tar.gz && \
-     tar -xzvf DynamoRIO-Linux-9.0.19078.tar.gz && \
-     rm DynamoRIO-Linux-9.0.19078.tar.gz
+# Install rr
+RUN cd /tmp && \
+    wget https://github.com/rr-debugger/rr/releases/download/5.7.0/rr-5.7.0-Linux-$(uname -m).deb && \
+    sudo dpkg -i rr-5.7.0-Linux-$(uname -m).deb
 
-COPY symcc/*.patch /tmp/
+COPY patches /tmp/patches
 
-# Build symcc with qsym backend
-RUN cd / && \
-    git config --global --add safe.directory /symcc && \
-    sudo git clone https://github.com/eurecom-s3/symcc.git && cd symcc && \
-    sudo git checkout 07c8895fea8e5fae90417df60a130be7a9c63d92 && \
-    sudo chown -R user:user /symcc && \
-    git submodule init && git submodule update && \
-    cp /tmp/symcc.patch . && \
-    git apply symcc.patch && \
-    cmake -G Ninja -DQSYM_BACKEND=ON -DZ3_TRUST_SYSTEM_VERSION=on . && \
-    ninja check && \
-    cd util/symcc_fuzzing_helper && \
-    cargo build --release
-
-# Build symcc with simple backend
-RUN cd / && \
-    git config --global --add safe.directory /symcc-simple-backend && \
-    sudo git clone https://github.com/eurecom-s3/symcc.git symcc-simple-backend  && cd symcc-simple-backend && \
-    sudo git checkout 07c8895fea8e5fae90417df60a130be7a9c63d92 && \
-    sudo chown -R user:user /symcc-simple-backend && \
-    git submodule init && git submodule update && \
-    cp /tmp/symcc.patch . && \
-    git apply symcc.patch && \
-    cmake -G Ninja -DQSYM_BACKEND=OFF -DZ3_TRUST_SYSTEM_VERSION=on . && \
-    ninja check
-
-# Build the c++ std library with symcc support.
-RUN cd / && \
-    sudo mkdir -p /libcxx_symcc && \
-    sudo git clone https://github.com/llvm/llvm-project.git --branch llvmorg-11.1.0 libcxx_symcc_build && \
-    cd /libcxx_symcc_build && \
-    sudo chown -R user:user /libcxx_symcc_build && \
-    export SYMCC_REGULAR_LIBCXX=yes; \
-    export SYMCC_NO_SYMBOLIC_INPUT=yes; \
-    mkdir build; cd build; cmake -G Ninja ../llvm \
-        -DLLVM_ENABLE_PROJECTS="libcxx;libcxxabi" \
-        -DLLVM_TARGETS_TO_BUILD="X86" \
-        -DLLVM_DISTRIBUTION_COMPONENTS="cxx;cxxabi;cxx-headers" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX=/libcxx_symcc \
-        -DCMAKE_C_COMPILER=/symcc-simple-backend/symcc \
-        -DCMAKE_CXX_COMPILER=/symcc-simple-backend/sym++  && \
-    sudo -E ninja distribution && \
-    sudo -E ninja install-distribution
-
-# Install WEIZZ
-USER root
-RUN sudo apt install libtool-bin python -y && \
-    cd / && \
-    mkdir -p weizz-fuzzer && \
-    git clone --depth 1 https://github.com/andreafioraldi/weizz-fuzzer.git weizz-fuzzer && \
-    cd weizz-fuzzer && \
-    git checkout c9cbeef0b057b9f7dc62af9b20629090b1b9fe4f && \
+# Install afl-net
+RUN sudo mkdir /competitors && \
+    sudo chown user:user -R /competitors && \
+    cd /competitors && \
+    git clone https://github.com/aflnet/aflnet.git && \
+    cd aflnet  && \
+    git checkout 62d63a59230bb5f5c6e54cddd381b9425dba3726 && \
+    git apply /tmp/patches/aflnet.patch && \
+    make clean all && \
+    cd  llvm_mode && \
     make
 
-COPY env/check_env.sh /usr/bin/
-USER user
+# Install SGFuzz
+RUN cd /competitors && \
+    git clone https://github.com/bajinsheng/SGFuzz.git && \
+    cd SGFuzz && \
+    git checkout 00dbbd70ba79f1bcff3f7dfdb4fda0645cf91225 && \
+    git apply /tmp/patches/sgfuzz.patch && \
+    ./build.sh && \
+    sudo cp libsfuzzer.a /usr/lib/libsFuzzer.a
+
+# Install hongfuzz netdrive that is used by SGFuzz
+RUN cd /competitors && \
+    git clone https://github.com/google/honggfuzz.git && \
+    cd honggfuzz && \
+    git checkout 6f89ccc9c43c6c1d9f938c81a47b72cd5ada61ba && \
+    CC=clang CFLAGS="-fsanitize=fuzzer-no-link -fsanitize=address" make libhfcommon/libhfcommon.a && \
+    CC=clang CFLAGS="-fsanitize=fuzzer-no-link -fsanitize=address -DHFND_RECVTIME=1" make libhfnetdriver/libhfnetdriver.a && \
+    sudo mv libhfcommon/libhfcommon.a /usr/lib/libhfcommon.a && \
+    sudo mv libhfnetdriver/libhfnetdriver.a /usr/lib/libhfnetdriver.a
+
+# Install StateAfl
+RUN sudo apt install -y tshark && sudo pip3 install --break-system-packages pyshark
+RUN cd /competitors && \
+    git clone https://github.com/stateafl/stateafl.git  && \
+    cd stateafl  && \
+    git checkout d923e22f7b2688db45b08f3fa3a29a566e7ff3a4  && \
+    git submodule init && \
+    git submodule update && \
+    git apply /tmp/patches/stateafl.patch && \
+    make -j  && \
+    cd llvm_mode  && \
+    rm -f libmvptree.a containers.a libtlsh.a && \
+    cd tlsh && \
+    git apply /tmp/patches/tlsh.patch && \
+    cd .. && \
+    make -j
+
+# Pubkey part of /home/user/shared/fuzztruction-experiments/comparison-with-state-of-the-art/configurations/networked/dropbear/keys/ecdsa and .../rsa_key
+# /home/user/fuzztruction/fuzztruction-experiments/comparison-with-state-of-the-art/binaries/networked/dropbear/consumer_afl_net/dropbear/dropbearkey ed25519  -y -f $PWD/ed25519
+RUN sudo chown -R user:user /home/user && \
+    mkdir -p /home/user/.ssh && \
+    echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDtqJ7zOtqQtYqOo0CpvDXNlMhV3HeJDpjrASKGLWdop" > /home/user/.ssh/authorized_keys && \
+    echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQDP+l17CnFodziIFoUI/xrKiJuct7eK8O6GSr5hH+a3rC1zn4bfbvUE2+io1ftzvnelaKxBOJWXA5xYH6kBDnGiUqhDqHrmI/1slBxUA94QVabWqqhLNLnxtljuDVOkcV6V8iLkDR+jIKiqXjbvWnyItMG/RTydLc2l6dfm9/1BrQ==" >> /home/user/.ssh/authorized_keys && \
+    chmod 600 /home/user/.ssh/authorized_keys
+
+RUN sudo apt purge ccache -y

@@ -101,9 +101,12 @@ bool FuzztructionSourcePreprocesssingPass::replaceMemFunctions(Module &M) {
 }
 
 bool FuzztructionSourcePreprocesssingPass::runOnModule(Module &M) {
-    dbgs() << "Running FuzztructionSourcePreprocesssingPass\n";
-    bool module_modified = false;
-    module_modified |= replaceMemFunctions(M);
+    if (!std::getenv("FT_DISABLE_PREPROCESSING"))  {
+        dbgs() << "Running FuzztructionSourcePreprocesssingPass\n";
+        bool module_modified = false;
+        module_modified |= replaceMemFunctions(M);
 
-    return module_modified;
+        return module_modified;
+    }
+    return false;
 }

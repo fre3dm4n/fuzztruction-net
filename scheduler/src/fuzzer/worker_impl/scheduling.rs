@@ -15,7 +15,8 @@ use rand::{prelude::SliceRandom, thread_rng, Rng};
 use super::FuzzingPhase;
 use crate::fuzzer::{queue::QueueEntry, worker::FuzzingWorker};
 
-const FAVOURED_RECALCULATION_INTERVAL: u64 = 50;
+const FAVOURED_RECALCULATION_START_DELAY: Duration = Duration::from_secs(3600);
+const FAVOURED_RECALCULATION_INTERVAL: u64 = 100;
 static RECALCULATION_CTR: AtomicU64 = AtomicU64::new(0);
 
 fn recalculate_favoured_sink_dominator_edges(entries: &[Arc<QueueEntry>]) {
@@ -28,11 +29,12 @@ fn recalculate_favoured_sink_dominator_edges(entries: &[Arc<QueueEntry>]) {
             if let Some(current_dominator) = current_dominator {
                 let current_bytes_set = *bytes_set_lut
                     .entry(current_dominator)
-                    .or_insert_with(|| current_dominator.covered_edges().count_bytes_set());
+                    .or_insert_with(|| current_dominator.covered_edges().count_bits_set());
                 let candidate_bytes_set = *bytes_set_lut
                     .entry(candidate)
-                    .or_insert_with(|| candidate.covered_edges().count_bytes_set());
+                    .or_insert_with(|| candidate.covered_edges().count_bits_set());
                 if current_bytes_set < candidate_bytes_set {
+                    current_dominator.stats_rw().favoured_decrement();
                     edge_dominator.insert(edge, candidate);
                 }
             } else {
@@ -41,7 +43,7 @@ fn recalculate_favoured_sink_dominator_edges(entries: &[Arc<QueueEntry>]) {
         }
     }
     for entry in edge_dominator.values() {
-        entry.stats_rw().mark_favoured();
+        entry.stats_rw().mark_favoured_once();
     }
 }
 
@@ -60,15 +62,20 @@ fn recalculate_favoured_unique_patch_point_ids(entries: &[Arc<QueueEntry>]) {
     for (_, qentries) in pp_to_entries.iter() {
         let entry = qentries
             .iter()
-            .max_by_key(|entry| entry.covered_edges().count_bytes_set())
+            .max_by_key(|entry| entry.covered_edges().count_bits_set())
             .take()
             .unwrap();
-        entry.stats_rw().mark_favoured();
+        entry.stats_rw().mark_favoured_once();
     }
 }
 
 impl FuzzingWorker {
     fn recalculate_favoured(&mut self, entries: &mut [Arc<QueueEntry>]) {
+        // Delay the first run of the favoured recalculation.
+        if self.start_ts.elapsed() < FAVOURED_RECALCULATION_START_DELAY {
+            return;
+        }
+
         // Only run this function every FAVOURED_RECALCULATION_INTERVAL time
         // it is called.
         let val = RECALCULATION_CTR.fetch_add(1, Ordering::Relaxed);
@@ -91,7 +98,7 @@ impl FuzzingWorker {
 
     fn schedule_common(&mut self) -> Arc<QueueEntry> {
         let queue = self.queue.lock().unwrap();
-        let mut entries = queue.iter().collect::<Vec<_>>();
+        let mut entries = queue.iter_without_crashes().collect::<Vec<_>>();
         drop(queue);
 
         self.filter_entries(&mut entries);
@@ -120,7 +127,7 @@ impl FuzzingWorker {
 
         // Reduce the weight of the chosen entry, those it is less likely
         // to be picked again.
-        selected_entry.stats_rw().favoured_weight_decrement();
+        selected_entry.stats_rw().favoured_decrement();
 
         Arc::clone(selected_entry)
     }
@@ -161,6 +168,7 @@ impl FuzzingWorker {
                         e.generation() == 0
                             && !e.stats_ro().blacklisted()
                             && !e.stats_ro().is_phase_done(FuzzingPhase::Discovery)
+                            && !e.is_crash()
                     });
                     if entries.is_empty() {
                         log::info!("No queue entries that can be processed via {:?} are left. Switching phase.", FuzzingPhase::Discovery);

@@ -15,6 +15,8 @@ pass.
 #include "debug.h"
 #include <assert.h>
 
+#include <llvm/Config/llvm-config.h>
+
 typedef uint8_t  u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
@@ -126,20 +128,27 @@ args_t* rewrite_argv(const char *argv[], int argc, arg_settings_t* arg_settings)
 
     // Make sure llvm does not use builtins, since we want to
     // replace all calls with out custom instrumented implementations.
-    self->argv[self->argc++] = "-fno-builtin-memcpy";
-    self->argv[self->argc++] = "-fno-builtin-memmove";
-    self->argv[self->argc++] = "-fno-slp-vectorize";
-    self->argv[self->argc++] = "-fno-vectorize";
+    // self->argv[self->argc++] = "-fno-builtin-memcpy";
+    // self->argv[self->argc++] = "-fno-builtin-memmove";
 
+    //self->argv[self->argc++] = "-fno-slp-vectorize";
+    //self->argv[self->argc++] = "-fno-vectorize";
     //self->argv[self->argc++] = "-mno-sse2";
-    self->argv[self->argc++] = "-mno-avx";
+    //self->argv[self->argc++] = "-mno-avx";
 
-    // Run our pass
-    self->argv[self->argc++] = "-Xclang";
-    self->argv[self->argc++] = "-load";
-    self->argv[self->argc++] = "-Xclang";
-    self->argv[self->argc++] = pass_path;
+#if LLVM_VERSION_MAJOR >= 11                                /* use new pass manager */
+  #if LLVM_VERSION_MAJOR < 16
+      self->argv[self->argc++] = "-fexperimental-new-pass-manager";
+  #endif
 
+    char *pass_plugin_flag;
+    if (asprintf(&pass_plugin_flag, "-fpass-plugin=%s", pass_path) < 0) {
+        PFATAL("Failed to allocate");
+    }
+    self->argv[self->argc++] = pass_plugin_flag;
+#else
+#error "Unsupported LLVM version"
+#endif
 
     /* Process initially passed arguments and potentially drop some of these */
     const char** current = &argv[1];
@@ -154,9 +163,9 @@ args_t* rewrite_argv(const char *argv[], int argc, arg_settings_t* arg_settings)
     }
 
     // Link against our agent that is called by a call our pass injected into main().
-    // FIXME: this path should not be absolute.
     self->argv[self->argc++] = "-L/home/user/fuzztruction/target/debug";
     self->argv[self->argc++] = "-lgenerator_agent";
+    self->argv[self->argc++] = "-DNDEBUG";
 
     // Enable debug output.
     //self->argv[self->argc++] = "-v";

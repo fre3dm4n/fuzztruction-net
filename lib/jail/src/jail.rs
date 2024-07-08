@@ -39,7 +39,7 @@ where
     }
 }
 
-pub fn drop_privileges(uid: u32, gid: u32, permanent: bool) -> Result<()> {
+fn internal_drop_privileges(uid: u32, gid: u32, permanent: bool) -> Result<()> {
     if permanent {
         unsafe {
             wrap_libc(|| libc::setgid(gid))?;
@@ -52,14 +52,6 @@ pub fn drop_privileges(uid: u32, gid: u32, permanent: bool) -> Result<()> {
         }
     }
 
-    Ok(())
-}
-
-pub fn acquire_privileges() -> Result<()> {
-    unsafe {
-        wrap_libc(|| libc::seteuid(0)).context("Failed to call seteuid(0)")?;
-        wrap_libc(|| libc::setegid(0)).context("Failed to call setegid(0)")?;
-    };
     Ok(())
 }
 
@@ -79,23 +71,11 @@ impl Jail {
         Ok(ret)
     }
 
-    fn acquire_privileges(&self) -> Result<()> {
-        acquire_privileges()?;
-        Ok(())
-    }
-
     fn drop_privileges(&self, permanent: bool) -> Result<()> {
         if let Some(target_ids) = self.builder.drop_to {
-            drop_privileges(target_ids.0, target_ids.1, permanent)?
+            internal_drop_privileges(target_ids.0, target_ids.1, permanent)?
         }
         Ok(())
-    }
-
-    fn _with_dropped_privileges<T>(&self, f: impl Fn() -> T) -> Result<T> {
-        self.drop_privileges(false)?;
-        let ret = f();
-        self.acquire_privileges()?;
-        Ok(ret)
     }
 
     fn mount(args: &[impl AsRef<OsStr>]) -> Result<process::Output> {
@@ -121,9 +101,6 @@ impl Jail {
     /// Enter the Jail. This will cause the calling process to be moved into the
     /// Jail. Calling this function requires the calling process to have EUID of 0.
     pub fn enter(&mut self) -> Result<()> {
-        self.acquire_privileges()
-            .context("Failed to acquire privileges")?;
-
         // Make sure mounts to /tmp are visible in this mount NS and the unshared
         // one.
         //Jail::mount(&["--make-shared", "/tmp"]).context("Failed to make /tmp shared")?;
@@ -140,9 +117,22 @@ impl Jail {
 
         // Mount the bear minimum to allow execution of software.
 
-        // Mount / as RO. This does not contain any submounts!
-        Jail::mount(&["-o", "rbind,ro", "/", &self.new_root])
+        // Mount / into our new root
+        Jail::mount(&["--bind", "-o", "-ro", "/", &self.new_root])
             .context("Failed to mount / into new root")?;
+        Jail::remount_bind_mount_ro(&self.new_root).context("Failed to remount / as ro")?;
+
+        let default_ro_source_dirs = [
+            "/home/user/fuzztruction",
+            "/etc/hosts",
+            "/etc/hostname",
+            "/etc/resolv.conf",
+        ];
+        for source in default_ro_source_dirs {
+            let dst = format!("{}{}", &self.new_root, source);
+            Jail::mount(&["--bind", source, &dst]).context("Failed to mount default ro dir")?;
+            Jail::remount_bind_mount_ro(&dst).context("Failed to remount as ro")?;
+        }
 
         // Mount /proc, /sys and /dev. These are shared since they are also marked as shared in the "parent" namespace.
         Jail::mount(&["-o", "bind", "/proc", &format!("{}/proc", self.new_root)])
@@ -179,10 +169,8 @@ impl Jail {
             }
             let path = path.to_str().unwrap();
             let dst_path = format!("{}/{}", self.new_root, path);
-            self.drop_privileges(false)?;
             fs::create_dir_all(&dst_path)
                 .context(format!("Failed to crate mount dst dir: {:?}", &dst_path))?;
-            self.acquire_privileges()?;
             Jail::mount(&["--bind", "-o", "rw", path, &dst_path])
                 .context(format!("Failed to mount {} to {}", path, &dst_path))?;
         }
@@ -195,17 +183,15 @@ impl Jail {
             }
             let path = path.to_str().unwrap();
             let dst_path = format!("{}/{}", self.new_root, path);
-            self.drop_privileges(false)?;
             fs::create_dir_all(&dst_path)
                 .context(format!("Failed to crate mount dst dir: {:?}", &dst_path))?;
-            self.acquire_privileges()?;
             Jail::mount(&["--bind", "-o", "ro", path, &dst_path])
                 .context(format!("Failed to mount {} to {}", path, &dst_path))?;
         }
 
         println!("Switching to new root");
         unix::fs::chroot(&self.new_root)?;
-        env::set_current_dir("/").context("Failed to switch working directory")?;
+        env::set_current_dir("/tmp").context("Failed to switch working directory")?;
         self.drop_privileges(true)?;
 
         let out = process::Command::new("cat")
@@ -234,6 +220,12 @@ impl Jail {
                 path_ref.to_owned()
             }
         }
+    }
+
+    fn remount_bind_mount_ro(mount_path: &str) -> Result<()> {
+        Jail::mount(&["-o", "remount,ro,bind", mount_path])
+            .with_context(|| format!("Failed to remount {} as ro", mount_path))?;
+        Ok(())
     }
 }
 

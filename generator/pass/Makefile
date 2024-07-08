@@ -21,7 +21,7 @@ clean:
 	-find -iname "*.o" -exec rm -v {} \;
 
 # The llvm pass that injects patchpoints during compilation.
-fuzztruction-source-llvm-pass.so: fuzztruction-source-llvm-pass.cc fuzztruction-preprocessing-pass.cc
+fuzztruction-source-llvm-pass.so: fuzztruction-source-llvm-pass.cc #fuzztruction-preprocessing-pass.cc
 	$(CXX) $(CLANG_CFL) -fPIC -shared $^ -o $@ $(CLANG_LFL)
 
 # Wrapper around clang that injects our custom runtime and llvm pass during compilitation
@@ -35,7 +35,7 @@ fuzztruction-source-clang-fast++: fuzztruction-source-clang-fast
 
 # Replacement for common mem related function like memcpy, memmove,...
 mem_functions.ll: mem_functions.c fuzztruction-source-clang-fast
-	$(CC) -fno-builtin-memcpy -fno-builtin-memcpy -fno-builtin-memmove -O0 -S -emit-llvm $<
+	./fuzztruction-source-clang-fast -fno-builtin-memcpy -fno-builtin-memcpy -fno-builtin-memmove -O0 -S -emit-llvm $<
 
 install: all
 	install -m 755 fuzztruction-source-clang-fast fuzztruction-source-clang-fast++ /usr/bin

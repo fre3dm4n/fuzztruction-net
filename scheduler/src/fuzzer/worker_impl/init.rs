@@ -1,6 +1,6 @@
 use anyhow::Result;
 use fuzztruction_shared::util::ExpectNone;
-use std::{cell::RefCell, fs};
+use std::{cell::RefCell, fs, process};
 
 use crate::{
     constants::AVG_EXECUTION_TIME_STABILIZATION_VALUE,
@@ -31,10 +31,20 @@ impl FuzzingWorker {
         self.sink.expect_none("already initialized?");
 
         fs::create_dir_all(&self.crashing_inputs).unwrap();
+        fs::create_dir_all(&self.asan_reports).unwrap();
         fs::create_dir_all(&self.interesting_inputs).unwrap();
 
-        self.source = Some(Source::from_config(&self.config, Some(self.uid.0))?);
-        self.sink = Some(AflSink::from_config(&self.config, Some(self.uid.0))?);
+        self.source = Some(Source::from_config(&self.config, Some(self.uid.0), None)?);
+        self.sink = Some(AflSink::from_config(&self.config, Some(self.uid.0), None)?);
+
+        let ret = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+        assert!(ret == 0);
+
+        let ret = process::Command::new("ip")
+            .args(["link", "set", "dev", "lo", "up"])
+            .spawn()?
+            .wait_with_output()?;
+        log::info!("ret={:?}", ret);
 
         self.source.as_mut().unwrap().start()?;
         self.sink.as_mut().unwrap().start()?;
@@ -108,8 +118,11 @@ impl FuzzingWorker {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 error = Some(e);
             } else {
-                let entries = success.unwrap();
+                let mut entries = success.unwrap();
                 let mut queue = self.queue.lock().unwrap();
+                entries.iter_mut().for_each(|e| {
+                    e.set_creation_ts((chrono::Utc::now() - queue.start_ts()).num_milliseconds())
+                });
                 queue.append(entries)
             }
         });
@@ -176,8 +189,10 @@ impl FuzzingWorker {
                 None,
                 None,
                 None,
+                false,
+                None,
             );
-            log::info!("Import result: {:?}", &result);
+            log::info!("Import result: {:#?}", &result);
             match result {
                 Ok(entry) => {
                     self.report_execution_duration(

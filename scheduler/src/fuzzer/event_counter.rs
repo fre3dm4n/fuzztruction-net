@@ -117,7 +117,7 @@ impl FuzzerEventCounter {
     }
 
     pub fn time_since_last_new_path_or_crash(&self) -> Option<Duration> {
-        let last_path = vec![self.last_finding_ts, self.last_crash_ts];
+        let last_path = [self.last_finding_ts, self.last_crash_ts];
         match last_path.iter().filter(|ts| ts.is_some()).max() {
             Some(Some(ts)) => Some(ts.elapsed()),
             _ => None,

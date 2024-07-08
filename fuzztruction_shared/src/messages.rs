@@ -14,7 +14,7 @@ use std::slice;
 
 use anyhow::{anyhow, Result};
 
-use crate::types::PatchPointID;
+use crate::types::MutationSiteID;
 
 /// IDs of the different messages that can be send or received.
 /// NOTE: Keep in sync with C code base.
@@ -32,6 +32,9 @@ pub enum MessageType {
     KeepAlive = 14,
     ChildPid = 15,
     AuxStreamMessage = 16,
+    AfterListen = 17,
+    AfterBind = 18,
+    AfterConnect = 19,
 }
 
 impl Default for MessageType {
@@ -56,6 +59,9 @@ impl TryFrom<u8> for MessageType {
             x if x == MessageType::KeepAlive as u8 => MessageType::KeepAlive,
             x if x == MessageType::ChildPid as u8 => MessageType::ChildPid,
             x if x == MessageType::AuxStreamMessage as u8 => MessageType::AuxStreamMessage,
+            x if x == MessageType::AfterListen as u8 => MessageType::AfterListen,
+            x if x == MessageType::AfterBind as u8 => MessageType::AfterBind,
+            x if x == MessageType::AfterConnect as u8 => MessageType::AfterConnect,
             _ => return Err(()),
         };
         Ok(ret)
@@ -333,14 +339,14 @@ impl Message for ShutdownMessage {
 #[repr(C)]
 pub struct TracePointStat {
     header: MsgHeader,
-    pub patch_point_id: PatchPointID,
+    pub patch_point_id: MutationSiteID,
     pub cnt: u64,
     pub execution_index: Option<NonZeroU64>,
 }
 
 impl TracePointStat {
     pub fn new(
-        patch_point_id: PatchPointID,
+        patch_point_id: MutationSiteID,
         cnt: u64,
         execution_index: Option<NonZeroU64>,
     ) -> TracePointStat {
@@ -357,7 +363,7 @@ impl Default for TracePointStat {
     fn default() -> Self {
         TracePointStat {
             header: MsgHeader::new(MessageType::MsgIdTracePointStat),
-            patch_point_id: PatchPointID::invalid(),
+            patch_point_id: MutationSiteID::invalid(),
             execution_index: None,
             cnt: 0,
         }
@@ -494,6 +500,93 @@ impl Message for ChildPid {
 }
 
 #[derive(Debug)]
+#[repr(C)]
+pub struct AfterListen {
+    header: MsgHeader,
+}
+impl AfterListen {
+    pub fn new() -> Self {
+        AfterListen {
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for AfterListen {
+    fn default() -> Self {
+        AfterListen {
+            header: MsgHeader::new(MessageType::AfterListen),
+        }
+    }
+}
+impl Message for AfterListen {
+    fn message_type() -> MessageType {
+        MessageType::AfterListen
+    }
+    fn sanitize(&self) -> Result<()> {
+        Ok(self.header.sanitize()?)
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct AfterBind {
+    header: MsgHeader,
+}
+impl AfterBind {
+    pub fn new() -> Self {
+        AfterBind {
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for AfterBind {
+    fn default() -> Self {
+        AfterBind {
+            header: MsgHeader::new(MessageType::AfterBind),
+        }
+    }
+}
+impl Message for AfterBind {
+    fn message_type() -> MessageType {
+        MessageType::AfterBind
+    }
+    fn sanitize(&self) -> Result<()> {
+        Ok(self.header.sanitize()?)
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct AfterConnect {
+    header: MsgHeader,
+}
+impl AfterConnect {
+    pub fn new() -> Self {
+        AfterConnect {
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for AfterConnect {
+    fn default() -> Self {
+        AfterConnect {
+            header: MsgHeader::new(MessageType::AfterConnect),
+        }
+    }
+}
+impl Message for AfterConnect {
+    fn message_type() -> MessageType {
+        MessageType::AfterConnect
+    }
+    fn sanitize(&self) -> Result<()> {
+        Ok(self.header.sanitize()?)
+    }
+}
+
+#[derive(Debug)]
 pub enum ReceivableMessages {
     HelloMessage(HelloMessage),
     RunMessage(RunMessage),
@@ -503,11 +596,6 @@ pub enum ReceivableMessages {
     SyncMutations(SyncMutations),
     Ok(Ok),
     ChildPid(ChildPid),
-}
-
-#[cfg(test)]
-mod test {
-
-    #[test]
-    fn test() {}
+    AfterListen(AfterListen),
+    AfterBind(AfterBind),
 }
