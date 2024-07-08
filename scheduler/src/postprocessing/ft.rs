@@ -43,7 +43,7 @@ pub fn ft_reproduce_crashes(
     timeout: Duration,
     target_qe_id: Option<u64>,
     iterations: usize,
-    enable_rr: bool,
+    _enable_rr: bool,
 ) -> Result<()> {
     let tcpdump = configure_tcpdump(config, Some(format!("id:{}", target_qe_id.unwrap())), true);
 

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::panic;
+
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct LogRecordWrapper {

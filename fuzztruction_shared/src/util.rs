@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use log::log_enabled;
 use nix::{
     sys::signal::Signal,
@@ -14,7 +14,7 @@ use std::{
     thread,
     time::Duration,
 };
-use syscalls::{syscall, syscall2, Sysno};
+use syscalls::{syscall2, Sysno};
 
 pub trait ExpectNone {
     /// Whether this value is None.

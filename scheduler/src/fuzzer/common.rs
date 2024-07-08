@@ -18,7 +18,7 @@ use crate::{
     mutation_cache_ops::MutationCacheOpsEx,
     networked::{get_consumer, get_producer, Client, Server, WaitForPeerResult},
     sink::{self, AflSink},
-    sink_bitmap::{Bitmap, BitmapStatus},
+    sink_bitmap::Bitmap,
     source::{self, Source},
     trace::Trace,
 };
@@ -171,7 +171,7 @@ fn start_tcpdump(_config: &Config) -> Option<TcpDumpInstance> {
 /// # Errors:
 ///
 /// CalibrationError
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
 pub fn common_calibrate(
     config: &Config,
     source: &mut Source,

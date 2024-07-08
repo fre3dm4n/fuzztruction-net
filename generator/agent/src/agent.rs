@@ -1,4 +1,4 @@
-use byte_unit::Unit;
+
 use fuzztruction_shared::messages;
 use fuzztruction_shared::{
     communication_channel::{CommunicationChannel, CommunicationChannelError},

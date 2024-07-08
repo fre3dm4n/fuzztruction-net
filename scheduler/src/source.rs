@@ -1,6 +1,6 @@
 #![allow(clippy::type_complexity)]
 
-use byte_unit::{n_gib_bytes, n_mib_bytes};
+use byte_unit::{n_mib_bytes};
 use fuzztruction_shared::{
     aux_messages::{AuxStreamMessage, AuxStreamType},
     aux_stream::AuxStreamAssembler,
@@ -195,7 +195,6 @@ pub struct Source {
     args: Vec<String>,
     /// Workdir
     workdir: PathBuf,
-    workdir_root: String,
     /// Directory containing data related to the sources state.
     state_dir: PathBuf,
     /// The way input is consumed.
@@ -252,8 +251,6 @@ impl Source {
         config: Option<&Config>,
     ) -> Result<Source> {
         let mut workdir_file_whitelist = Vec::new();
-        let workdir_root = workdir.clone();
-
         workdir.push("source");
 
         let mut state_dir = workdir.clone();
@@ -481,7 +478,6 @@ impl Source {
             path,
             args,
             workdir,
-            workdir_root: workdir_root.to_str().unwrap().to_owned(),
             state_dir,
             input_channel,
             output_channel,

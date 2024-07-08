@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Result;
 use clap::ArgMatches;
-use glob::glob;
+
 use scheduler::{
     competitors,
     config::Config,

@@ -30,7 +30,7 @@ impl FuzzingWorker {
     ///
     /// Every Error returned by this function must be considered fatal.
     ///
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::cognitive_complexity)]
     pub fn fuzz_candidates(
         &mut self,
         mutations: Vec<(

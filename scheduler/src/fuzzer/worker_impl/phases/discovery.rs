@@ -3,7 +3,7 @@ use std::time::Duration;
 use fuzztruction_shared::{
     mutation_cache::MutationCache, mutation_cache_entry::MutationCacheEntry,
 };
-use llvm_stackmap::LLVMInstruction;
+
 use rand::{prelude::SliceRandom, thread_rng};
 
 use crate::{

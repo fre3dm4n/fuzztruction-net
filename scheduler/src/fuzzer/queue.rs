@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use lazy_static::lazy_static;
 
 use crate::{
-    constants::{MAX_PATCHPOINT_CNT, MAX_QUEUE_DUMP_THREADS, MAX_QUEUE_ENTRY_CNT},
+    constants::{MAX_PATCHPOINT_CNT, MAX_QUEUE_ENTRY_CNT},
     finite_integer_set::FiniteIntegerSet,
     sink_bitmap::Bitmap,
     trace::Trace,

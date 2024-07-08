@@ -6,7 +6,7 @@ use glob::glob;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use log::error;
-use nix::unistd::{setgid, setuid, Pid};
+use nix::unistd::{setgid, setuid};
 
 use std::env::{self, set_current_dir};
 use std::net::{TcpStream, UdpSocket};
@@ -28,7 +28,7 @@ use thiserror::Error;
 
 use libc::{SIGKILL, SIGTERM, STDIN_FILENO};
 
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::Signal;
 
 use crate::config::Config;
 use crate::io_channels::InputChannel;
@@ -142,7 +142,6 @@ pub struct AflSink {
     /// Workdir
     #[allow(unused)]
     workdir: PathBuf,
-    workdir_root: String,
     /// Description of how the target binary consumes fuzzing input.
     input_channel: InputChannel,
     /// The file that is used to pass input to the target.
@@ -191,8 +190,6 @@ impl AflSink {
         log_stderr: bool,
     ) -> Result<AflSink> {
         reserver_forkserver_fds_once();
-        let workdir_root = workdir.to_str().unwrap().to_owned();
-
         workdir.push("sink");
 
         fs::create_dir_all(&workdir)?;
@@ -236,7 +233,6 @@ impl AflSink {
             path,
             args,
             workdir,
-            workdir_root,
             input_channel,
             input_file: (input_file, input_file_path),
             forkserver_sid: None,
@@ -393,6 +389,7 @@ impl AflSink {
         }
     }
 
+    #[allow(unreachable_code)]
     pub fn start(&mut self) -> Result<()> {
         // send_pipe[1](we) -> send_pipe[0](forkserver).
         let send_pipe = [0i32; 2];
@@ -552,7 +549,7 @@ impl AflSink {
                 }
 
                 if !self.enable_rr {
-                    if let Err(err) = self.drop_privileges() {
+                    if let Err(_err) = self.drop_privileges() {
                         panic!();
                     }
                 }

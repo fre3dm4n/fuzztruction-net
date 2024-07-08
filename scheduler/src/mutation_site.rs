@@ -117,6 +117,8 @@ impl MutationSite {
         self.target_value_size_in_bit
     }
 
+    /// # Safety
+    /// This is used for testing only.
     pub unsafe fn set_target_value_size_in_bits(&mut self, val: u32) {
         self.target_value_size_in_bit = val;
     }
