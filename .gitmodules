@@ -1,9 +1,9 @@
-[submodule "fuzztruction-experiments"]
-	path = fuzztruction-experiments
-	url = git@github.com:fuzztruction/fuzztruction-experiments-next.git
 [submodule "llvm"]
         path = llvm
         url = https://github.com/fuzztruction/fuzztruction-llvm.git
 [submodule "consumer/aflpp-consumer"]
 	path = consumer/aflpp-consumer
 	url = https://github.com/fuzztruction/aflpp-consumer.git
+[submodule "fuzztruction-experiments"]
+	path = fuzztruction-experiments
+	url = https://github.com/fuzztruction/fuzztruction-net-experiments.git
