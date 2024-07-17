@@ -493,21 +493,6 @@ impl AflSink {
                 let asan_options = CString::new(asan_options).unwrap();
                 envp.push(asan_options);
 
-                // UBSAN config
-                // let ubsan_logpath_option = format!(
-                //     "log_path={}",
-                //     self.ubsan_log_file.as_path().to_str().unwrap()
-                // );
-                let ubsan_options = [
-                    "print_stacktrace=1",
-                    //&ubsan_logpath_option,
-                ];
-
-                let ubsan_options = format!("UBSAN_OPTIONS={}", ubsan_options.join(":"));
-
-                let ubsan_options = CString::new(ubsan_options).unwrap();
-                envp.push(ubsan_options);
-
                 let llvm_cov_env = if let Some(coverage_report) = &self.coverage_report {
                     let ret = format!("LLVM_PROFILE_FILE={}", coverage_report.to_str().unwrap());
                     Some(CString::new(ret).unwrap())
