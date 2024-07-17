@@ -565,8 +565,8 @@ fn replace_workdir(config: &mut Config, matches: &ArgMatches) {
 
 fn configure_jail(config: &mut Config) -> Result<()> {
     if config.general.jail_drop_to_sudo_callee {
-        let uid = env::var("SUDO_UID").context("Getting SUDO_UID from environment")?;
-        let gid = env::var("SUDO_GID").context("Getting SUDO_GID from environment")?;
+        let uid = env::var("SUDO_UID").context("Failed to get SUDO_UID from environment. Please run via sudo or as root.")?;
+        let gid = env::var("SUDO_GID").context("Failed to get SUDO_GID from environment. Please run via sudo or as root")?;
         log::info!("Privileges will be dropped to uid: {uid:?} and gid: {gid:?}");
         config.general.jail_uid = Some(uid.parse().unwrap());
         config.general.jail_gid = Some(gid.parse().unwrap());
