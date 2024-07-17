@@ -540,7 +540,10 @@ impl AflSink {
                 }
 
                 if let Some(ref working_dir) = self.config.sink.working_dir {
+                    // Specific workdir was set in config
                     env::set_current_dir(working_dir).unwrap();
+                } else {
+                    env::set_current_dir(&self.workdir).unwrap();
                 }
 
                 // Make sure that UID == EUID, since if this is not the case,
