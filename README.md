@@ -1,11 +1,10 @@
-# Fuzztruction
-<p><a href="https://mu00d8.me/paper/bars2023fuzztruction.pdf"><img alt="Fuzztruction Paper Thumbnail" align="right" width="320" src="https://user-images.githubusercontent.com/1810786/204243236-9d0ddd3b-82c2-4b82-9859-d93ded3ea7e7.png"></a></p>
+# Fuzztruction-Net
+<p><a href="https://mschloegel.me/paper/bars2024fuzztructionnet.pdf"><img alt="Fuzztruction Paper Thumbnail" align="right" width="320" src="https://user-images.githubusercontent.com/1810786/204243236-9d0ddd3b-82c2-4b82-9859-d93ded3ea7e7.png"></a></p>
 
+Fuzztruction-Net is an academic prototype of a fuzzer that does not directly mutate the input messages (as most fuzzers do) sent to network applications under test but uses a fundamentally different approach that relies on *fault injection* rather than modifying messages. Effectively, we force one of the communication peers into a weird state where its output no longer matches the expectations of the target peer, potentially uncovering bugs. Importantly, this *weird peer* can still properly encrypt/sign the protocol message, overcoming a fundamental challenge of current fuzzers. In effect, we leave the communication system intact but introduce small corruptions. Since we can turn the server or the client into a weird peer, our approach is the first to test client-side network applications effectively.
 
-
-Fuzztruction is an academic prototype of a fuzzer that does not directly mutate inputs (as most fuzzers do) but instead uses a so-called generator application to produce an input for our fuzzing target. As programs generating data usually produce the correct representation, our fuzzer *mutates* the generator program (by injecting faults), such that the data produced is *almost* valid. Optimally, the produced data passes the parsing stages in our fuzzing target, called *consumer*, but triggers unexpected behavior in deeper program logic. This allows to even fuzz targets that utilize cryptography primitives such as encryption or message integrity codes. The main advantage of our approach is that it generates complex data without requiring heavyweight program analysis techniques, grammar approximations, or human intervention.
-
-For more details, check out our [paper](https://mschloegel.me/paper/bars2023fuzztruction.pdf). To cite our work, you can use the following BibTeX entry:
+For more details, check out our [paper](https://mschloegel.me/paper/bars2024fuzztructionnet.pdf).
+<!-- To cite our work, you can use the following BibTeX entry:
 ```bibtex
 @inproceedings{bars2023fuzztruction,
   title={Fuzztruction: Using Fault Injection-based Fuzzing to Leverage Implicit Domain Knowledge},
@@ -14,11 +13,11 @@ For more details, check out our [paper](https://mschloegel.me/paper/bars2023fuzz
   year={2023},
   author={Bars, Nils and Schloegel, Moritz and Scharnowski, Tobias and Schiller, Nico and Holz, Thorsten},
 }
-```
+``` -->
 
-For instructions on how to reproduce the experiments from the paper, please read the [`fuzztruction-experiments`](https://github.com/fuzztruction/fuzztruction-experiments) submodule documentation *after* reading this document.
+For instructions on how to reproduce the experiments from the paper, please read the [`fuzztruction-experiments`](https://github.com/fuzztruction/fuzztruction-net-experiments) submodule documentation *after* reading this document.
 
-> <b><span style="color:red">Compatibility:</span></b> While we try to make sure that our prototype is as platform independent as possible, we are not able to test it on all platforms. Thus, if you run into issues, please use Ubuntu 22.04.1, which was used during development as the host system.
+> <b><span style="color:red">Compatibility:</span></b> While we try to make sure that our prototype is as platform independent as possible, we are not able to test it on all platforms. Thus, if you run into issues, please use Ubuntu 22.04.2, which was used during development as the host system.
 
 
 
@@ -27,17 +26,17 @@ For instructions on how to reproduce the experiments from the paper, please read
 ## Quickstart
 ```bash
 # Clone the repository
-git clone --recurse-submodules https://github.com/fuzztruction/fuzztruction.git
+git clone --recurse-submodules https://github.com/fuzztruction/fuzztruction-net.git
 
 # Option 1: Get a pre-built version of our runtime environment.
 # To ease reproduction of experiments in our paper, we recommend using our
 # pre-built environment to avoid incompatibilities (~30 GB of data will be
-# donwloaded)
+# downloaded)
 # Do NOT use this if you don't want to reproduce our results but instead fuzz
 # own targets (use the next command instead).
 ./env/pull-prebuilt.sh
 
-# Option 2: Build the runtime environment for Fuzztruction from scratch.
+# Option 2: Build the runtime environment for Fuzztruction-Net from scratch.
 # Do NOT run this if you executed pull-prebuilt.sh
 ./env/build.sh
 
@@ -53,11 +52,11 @@ git clone --recurse-submodules https://github.com/fuzztruction/fuzztruction.git
 
 # Runninge start.sh the second time will automatically build the fuzzer.
 
-# See `Fuzzing a Target using Fuzztruction` below for further instructions.
+# See `Fuzzing a Target using Fuzztruction-Net` below for further instructions.
 ```
 
 ## Components
-Fuzztruction contains the following core components:
+Fuzztruction-Net contains the following core components:
 
 ### ****Scheduler****
 The scheduler orchestrates the interaction of the generator and the consumer. It governs the fuzzing campaign, and its main task is to organize the fuzzing loop. In addition, it also maintains a queue containing queue entries. Each entry consists of the seed input passed to the generator (if any) and all mutations applied to the generator. Each such queue entry represents a single test case. In traditional fuzzing, such a test case would be represented as a single file. The implementation of the scheduler is located in the [`scheduler`](./scheduler/) directory.
@@ -78,26 +77,26 @@ During fuzzing, the scheduler chooses a target from the set of patch points and 
 The agent, implemented in [`generator/agent`](./generator/agent/) is running in the context of the generator application that was compiled with the custom compiler pass. Its main tasks are the implementation of a forkserver and communicating with the scheduler. Based on the instruction passed from the scheduler via shared memory and a message queue, the agent uses a JIT engine to mutate the generator.
 
 ### ****Consumer****
-The generator's counterpart is the consumer: It is the target we are fuzzing that consumes the inputs generated by the generator. For Fuzztruction, it is sufficient to compile the consumer application with AFL++'s compiler pass, which we use to record the coverage feedback. This feedback guides our mutations of the generator.
+The generator's counterpart is the consumer: It is the target we are fuzzing that consumes the inputs generated by the generator. For Fuzztruction-Net, it is sufficient to compile the consumer application with AFL++'s compiler pass, which we use to record the coverage feedback. This feedback guides our mutations of the generator.
 
 # Preparing the Runtime Environment (Docker Image)
 Before using Fuzztruction, the runtime environment that comes as a Docker image is required. This image can be obtained by building it yourself locally or pulling a pre-built version. Both ways are described in the following. Before preparing the runtime environment, this repository, and all sub repositories, must be cloned:
 ```bash
-git clone --recurse-submodules https://github.com/fuzztruction/fuzztruction.git
+git clone --recurse-submodules https://github.com/fuzztruction/fuzztruction-net.git
 ```
 
 ### ****Local Build****
-The Fuzztruction runtime environment can be built by executing [`env/build.sh`](./env/build.sh). This builds a Docker image containing a complete runtime environment for Fuzztruction locally. By default, a [pre-built version](https://hub.docker.com/repository/docker/nbars/fuzztruction-llvm_debug) of our patched LLVM version is used and pulled from Docker Hub. If you want to use a locally built LLVM version, check the [`llvm`](https://github.com/fuzztruction/fuzztruction-llvm) directory.
+The Fuzztruction runtime environment can be built by executing [`env/build.sh`](./env/build.sh). This builds a Docker image containing a complete runtime environment for Fuzztruction-Net locally. By default, a [pre-built version](https://hub.docker.com/repository/docker/nbars/fuzztruction-llvm_debug) of our patched LLVM version is used and pulled from Docker Hub. If you want to use a locally built LLVM version, check the [`llvm`](https://github.com/fuzztruction/fuzztruction-llvm) directory.
 
 ### ****Pre-built****
 In most cases, there is no particular reason for using the pre-built environment -- except if you want to reproduce the exact experiments conducted in the paper. The pre-built image provides everything, including the pre-built evaluation targets and all dependencies. The image can be retrieved by executing [`env/pull-prebuilt.sh`](./env/pull-prebuilt.sh).
 
 
-The following section documents how to spawn a runtime environment based on either a locally built image or the prebuilt one. Details regarding the reproduction of the paper's experiments can be found in the [`fuzztruction-experiments`](https://github.com/fuzztruction/fuzztruction-experiments) submodule.
+The following section documents how to spawn a runtime environment based on either a locally built image or the prebuilt one. Details regarding the reproduction of the paper's experiments can be found in the [`fuzztruction-net-experiments`](https://github.com/fuzztruction/fuzztruction-net-experiments) submodule.
 
 
 ## Managing the Runtime Environment Lifecycle
-After building or pulling a pre-built version of the runtime environment, the fuzzer is ready to use. The fuzzers environment lifecycle is managed by a set of scripts located in the [`env`](./env/) folder.
+After building or pulling a pre-built version of the runtime environment, the fuzzer is ready to use. The fuzzer's environment lifecycle is managed by a set of scripts located in the [`env`](./env/) folder.
 
 | Script | Description |
 |--|---|
@@ -130,10 +129,10 @@ Inside the container, the following paths are (bind) mounted from the host:
 | `/ccache`  | `./data/ccache`  | Used to persist `ccache` cache between container restarts. |
 
 # Usage
-After building the Docker runtime environment and spawning a container, the Fuzztruction binary itself must be built. After spawning a shell inside the container using [`./env/start.sh`](./env/start.sh), the build process is triggered automatically. Thus, the steps in the next section are primarily for those who want to rebuild Fuzztruction after applying modifications to the code.
+After building the Docker runtime environment and spawning a container, the Fuzztruction-Net binary itself must be built. After spawning a shell inside the container using [`./env/start.sh`](./env/start.sh), the build process is triggered automatically. Thus, the steps in the next section are primarily for those who want to rebuild Fuzztruction after applying modifications to the code.
 
-## Building Fuzztruction
-For building Fuzztruction, it is sufficient to call `cargo build` in `/home/user/fuzztruction`. This will build all components described in the [Components](#Components) section. The most interesting build artifacts are the following:
+## Building Fuzztruction-Net
+For building Fuzztruction-Net, it is sufficient to call `cargo build` in `/home/user/fuzztruction`. This will build all components described in the [Components](#Components) section. The most interesting build artifacts are the following:
 
 
 | Artifacts  |  Description  |
@@ -143,19 +142,19 @@ For building Fuzztruction, it is sufficient to call `cargo build` in `/home/user
 | `./target/debug/libgenerator_agent.so`  | The agent the is injected into the generator application.  |
 | `./target/debug/fuzztruction`  | The fuzztruction binary representing the actual fuzzer. |
 
-## Fuzzing a Target using Fuzztruction
-We will use `libpng` as an example to showcase Fuzztruction's capabilities. Since `libpng` is relatively small and has no external dependencies, it is not required to use the pre-built image for the following steps. However, especially on mobile CPUs, the building process may take up to several hours for building the AFL++ binary because of the collision free coverage map encoding feature and compare splitting.
+## Fuzzing a Target using Fuzztruction-Net
+We will use `dropbear` as an example to showcase Fuzztruction-Net's capabilities. Since `dropbear` is relatively small and has no external dependencies, it is not required to use the pre-built image for the following steps.
 
 ### **Building the Target**
  <b><span style="color:red">Pre-built: If the pre-built version is used, building is unnecessary and this step can be skipped.</span></b><br>
-Switch into the `fuzztruction-experiments/comparison-with-state-of-the-art/binaries/` directory and execute `./build.sh libpng`. This will pull the source and start the build according to the steps defined in `libpng/config.sh`.
+Switch into the `fuzztruction-experiments/comparison-with-state-of-the-art/binaries/networked` directory and execute `./build.sh libpng src deps generator consumer`. This will pull the source and start the build according to the steps defined in `libpng/config.sh`.
 
 ### **Benchmarking the Target**
 Using the following command
 ```bash
-sudo ./target/debug/fuzztruction fuzztruction-experiments/comparison-with-state-of-the-art/configurations/pngtopng_pngtopng/pngtopng-pngtopng.yml  --purge --log-output benchmark -i 100
+sudo ./target/debug/fuzztruction ./fuzztruction-experiments/comparison-with-state-of-the-art/configurations/networked/dropbear/dbclient_dropbear.yml --purge --log-output benchmark -i 25
 ```
-allows testing whether the target works. Each target is defined using a `YAML` configuration file. The files are located in the `configurations` directory and are a good starting point for building your own config. The `pngtopng-pngtopng.yml` file is extensively documented.
+allows testing whether the target works. Each target is defined using a `YAML` configuration file. The files are located in the `configurations/networked` directory and are a good starting point for building your own config. The `dbclient_dropbear.yml` file is extensively documented.
 
 
 ### **Troubleshooting**
@@ -168,21 +167,11 @@ If the fuzzer terminates with an error, there are multiple ways to assist your d
 ### **Running the Fuzzer**
 To start the fuzzing process, executing the following command is sufficient:
 ```bash
-sudo ./target/debug/fuzztruction ./fuzztruction-experiments/comparison-with-state-of-the-art/configurations/pngtopng_pngtopng/pngtopng-pngtopng.yml fuzz -j 10 -t 10m
+sudo ./target/debug/fuzztruction ./fuzztruction-experiments/comparison-with-state-of-the-art/configurations/networked/dropbear/dbclient_dropbear.yml fuzz -j 10 -t 10m
 ```
-This will start a fuzzing run on 10 cores, with a timeout of 10 minutes. Output produced by the fuzzer is stored in the directory defined by the `work-directory` attribute in the target's config file. In case of `pngtopng`, the default location is `/tmp/pngtopng-pngtopng`.
+This will start a fuzzing run on 10 cores, with a timeout of 10 minutes. Output produced by the fuzzer is stored in the directory defined by the `work-directory` attribute in the target's config file. In case of `dropbear`, the default location is `/tmp/dclient-dropbear-1`.
 
-If the working directory already exists, `--purge` must be passed as an argument to `fuzztruction` to allow it to rerun. The flag must be passed before the subcommand, i.e., before `fuzz` or `benchmark`.
+If the working directory already exists, `--purge` must be passed as an argument to `fuzztruction` to allow it to rerun.
 
-### **Combining Fuzztruction and AFL++**
-For running AFL++ alongside Fuzztruction, the `aflpp` subcommand can be used to spawn AFL++ workers that are reseeded during runtime with inputs found by Fuzztruction. Assuming that Fuzztruction was executed using the command above, it is sufficient to execute
-```
-sudo ./target/debug/fuzztruction ./fuzztruction-experiments/comparison-with-state-of-the-art/configurations/pngtopng_pngtopng/pngtopng-pngtopng.yml aflpp -j 10 -t 10m
-```
-for spawning 10 AFL++ processes that are terminated after 10 minutes. Inputs found by Fuzztruction and AFL++ are periodically synced into the `interesting` folder in the working directory. In case AFL++ should be executed independently but based on the same `.yml` configuration file, the `--suffix` argument can be used to append a suffix to the working directory of the spawned fuzzer.
-
-
-### **Computing Coverage**
-After the fuzzing run is terminated, the `tracer` subcommand allows to retrieve a list of covered basic blocks for all interesting inputs found during fuzzing. These traces are stored in the `traces` subdirectory located in the working directory. Each trace contains a zlib compressed JSON object of the addresses of all basic blocks (in execution order) exercised during execution. Furthermore, metadata to map the addresses to the actual ELF file they are located in is provided.
-
-The `coverage` tool located at `./target/debug/coverage` can be used to process the collected data further. You need to pass it the top-level directory containing working directories created by Fuzztruction (e.g., `/tmp` in case of the previous example). Executing `./target/debug/coverage /tmp` will generate a `.csv` file that maps time to the number of covered basic blocks and a `.json` file that maps timestamps to sets of found basic block addresses. Both files are located in the working directory of the specific fuzzing run.
+<!-- ### **Computing Coverage**
+After the fuzzing run is terminated, the `llvm-cov` subcommand allows to compute coverage for a fuzzing run. -->
