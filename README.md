@@ -1,23 +1,22 @@
 # Fuzztruction-Net
-<p><a href="https://mschloegel.me/paper/bars2024fuzztructionnet.pdf"><img alt="Fuzztruction Paper Thumbnail" align="right" width="320" src="https://user-images.githubusercontent.com/1810786/204243236-9d0ddd3b-82c2-4b82-9859-d93ded3ea7e7.png"></a></p>
+<p><a href="https://mschloegel.me/paper/bars2024fuzztructionnet.pdf"><img alt="Fuzztruction-Net Paper Thumbnail" align="right" width="320" src="https://user-images.githubusercontent.com/1810786/204243236-9d0ddd3b-82c2-4b82-9859-d93ded3ea7e7.png"></a></p>
 
-Fuzztruction-Net is an academic prototype of a fuzzer that does not directly mutate the input messages (as most fuzzers do) sent to network applications under test but uses a fundamentally different approach that relies on *fault injection* rather than modifying messages. Effectively, we force one of the communication peers into a weird state where its output no longer matches the expectations of the target peer, potentially uncovering bugs. Importantly, this *weird peer* can still properly encrypt/sign the protocol message, overcoming a fundamental challenge of current fuzzers. In effect, we leave the communication system intact but introduce small corruptions. Since we can turn the server or the client into a weird peer, our approach is the first to test client-side network applications effectively.
+Fuzztruction-Net is an academic prototype of a fuzzer that does not directly mutate the input messages (as most other fuzzers do) sent to network applications under test, but it uses a fundamentally different approach that relies on *fault injection* instead. Effectively, we inject faults to force one of the communication peers into a weird state where its output no longer matches the expectations of the target peer, thereby potentially uncovering bugs. Importantly, this *weird peer* can still properly encrypt/sign the protocol messages, overcoming a fundamental challenge of current network application fuzzing. This is because we leave the communication system intact but introduce small corruptions. Since we can turn both the server or the client into a weird peer, our approach is the first capable of testing client-side network applications effectively.
 
 For more details, check out our [paper](https://mschloegel.me/paper/bars2024fuzztructionnet.pdf).
 <!-- To cite our work, you can use the following BibTeX entry:
 ```bibtex
 @inproceedings{bars2023fuzztruction,
-  title={Fuzztruction: Using Fault Injection-based Fuzzing to Leverage Implicit Domain Knowledge},
-  booktitle = {32st USENIX Security Symposium (USENIX Security 23)},
-  publisher = {USENIX Association},
-  year={2023},
-  author={Bars, Nils and Schloegel, Moritz and Scharnowski, Tobias and Schiller, Nico and Holz, Thorsten},
+  title={No Peer, No Cry: Network Application Fuzzing via Fault Injection},
+  author={Bars, Nils and Schloegel, Moritz and Schiller, Nico and Bernhard, Lukas and Holz, Thorsten},
+  booktitle = {ACM Conference on Computer and Communications Security (CCS)},
+  year={2024},
 }
 ``` -->
 
-For instructions on how to reproduce the experiments from the paper, please read the [`fuzztruction-experiments`](https://github.com/fuzztruction/fuzztruction-net-experiments) submodule documentation *after* reading this document.
+For instructions on how to reproduce the experiments from our paper, please read the [`fuzztruction-net-experiments`](https://github.com/fuzztruction/fuzztruction-net-experiments) submodule documentation *after* reading this document.
 
-> <b><span style="color:red">Compatibility:</span></b> While we try to make sure that our prototype is as platform independent as possible, we are not able to test it on all platforms. Thus, if you run into issues, please use Ubuntu 22.04.2, which was used during development as the host system.
+> <b><span style="color:red">Compatibility:</span></b> While we try to make sure that our prototype is as platform independent as possible, we are not able to test it on all platforms. If you run into issues, please use Ubuntu 22.04.2, which we used during development as the host system.
 
 
 
@@ -56,37 +55,37 @@ git clone --recurse-submodules https://github.com/fuzztruction/fuzztruction-net.
 ```
 
 ## Components
-Fuzztruction-Net contains the following core components:
+Fuzztruction-Net assumes two applications (called "peers") communicate via some network protocol. It will inject faults into one of the peers, called "weird peer", with the goal of fuzzing the second peer, called "target peer". To this end, Fuzztruction-Net contains the following core components:
 
 ### ****Scheduler****
-The scheduler orchestrates the interaction of the generator and the consumer. It governs the fuzzing campaign, and its main task is to organize the fuzzing loop. In addition, it also maintains a queue containing queue entries. Each entry consists of the seed input passed to the generator (if any) and all mutations applied to the generator. Each such queue entry represents a single test case. In traditional fuzzing, such a test case would be represented as a single file. The implementation of the scheduler is located in the [`scheduler`](./scheduler/) directory.
+The scheduler orchestrates the interaction of the weird peer and the target peer. It governs the fuzzing campaign, and its main task is to organize the fuzzing loop. In addition, it also maintains a queue containing queue entries. Each entry consists of the seed input passed to the weird peer (if any) and all mutations applied to the weird peer. Each such queue entry represents a single test case. In traditional fuzzing, such a test case would be represented as a single file. The implementation of the scheduler is located in the [`scheduler`](./scheduler/) directory.
 
-### ****Generator****
-The generator can be considered a seed generator for producing inputs tailored to the fuzzing target, the consumer. While common fuzzing approaches mutate inputs on the fly through bit-level mutations, we mutate inputs indirectly by injecting faults into the generator program. More precisely, we identify and mutate data operations the generator uses to produce its output. To facilitate our approach, we require a program that generates outputs that match the input format the fuzzing target expects.
+### ****Weird Peer****
+The weird peer can be considered a seed generator for producing inputs tailored to the fuzzing target, the target peer. Current network application fuzzers either replace the weird peer and send (mutated), pre-recorded messages to the target peer, or they mutate messages as a Man-in-the-Middle on the fly. Both types of approaches fall short in testing the target peer, as they are generally unaware of session state (they cannot reuse ephemeral values, e.g., session IDs), nor can they deal with encryption or other integrity protection mechanisms. By injecting faults into the weird peer, we overcome these challenges: The weird peer is an application that---by design---can correctly process and maintain session state, and it can apply all protection mechanisms; otherwise, it would not work as intended. Fault injection slightly subverts this correct behavior, causing erroneous and unexpected behavior in the target peer, thereby uncovering bugs. Note that it may happen that our faults corrupt the handling of session state or protection mechanisms, but this is no concern: It will cause an early termination of the communication, thus achieve less coverage, and thus the fault will be deprioritzed by our fuzzer and no longer scheduled.
 
-The implementation of the generator can be found in the [`generator`](./generator/) directory. It consists of two components that are explained in the following.
+The implementation of the weird peer can be found in the [`generator`](./generator/) directory. It consists of two components that are explained in the following.
 
 #### ****Compiler Pass****
-The compiler pass ([`generator/pass`](./generator/pass/)) instruments the target using so-called [patch points](https://llvm.org/docs/StackMaps.html). Since the current (tested on LLVM12 and below) implementation of this feature is unstable, we patch LLVM to enable them for our approach. The patches can be found in the [`llvm`](https://github.com/fuzztruction/fuzztruction-llvm) repository (included here as submodule). Please note that the patches are experimental and not intended for use in production.
+The compiler pass ([`generator/pass`](./generator/pass/)) instruments the target using so-called [patch points](https://llvm.org/docs/StackMaps.html). Since the current (tested on LLVM17.0.6 and below) implementation of this feature is unstable, we patch LLVM to enable them for our approach. The patches can be found in the [`llvm`](https://github.com/fuzztruction/fuzztruction-llvm) repository (included here as submodule). Please note that the patches are experimental and not intended for use in production.
 
 The locations of the patch points are recorded in a separate section inside the compiled binary. The code related to parsing this section can be found at [`lib/llvm-stackmap-rs`](https://github.com/fuzztruction/llvm-stackmap-rs), which we also published on [crates.io](https://crates.io/crates/llvm_stackmap).
 
 During fuzzing, the scheduler chooses a target from the set of patch points and passes its decision down to the agent (described below) responsible for applying the desired mutation for the given patch point.
 
 #### **Agent**
-The agent, implemented in [`generator/agent`](./generator/agent/) is running in the context of the generator application that was compiled with the custom compiler pass. Its main tasks are the implementation of a forkserver and communicating with the scheduler. Based on the instruction passed from the scheduler via shared memory and a message queue, the agent uses a JIT engine to mutate the generator.
+The agent, implemented in [`generator/agent`](./generator/agent/) is running in the context of the weird peer that was compiled with the custom compiler pass. Its main tasks are the implementation of a forkserver and communicating with the scheduler. Based on the instruction passed from the scheduler via shared memory and a message queue, the agent uses a JIT engine to mutate the weird peer.
 
 ### ****Consumer****
-The generator's counterpart is the consumer: It is the target we are fuzzing that consumes the inputs generated by the generator. For Fuzztruction-Net, it is sufficient to compile the consumer application with AFL++'s compiler pass, which we use to record the coverage feedback. This feedback guides our mutations of the generator.
+The weird peer's counterpart is the target peer: It is the target we are interested in testing and the communication partner of the weird peer. For Fuzztruction-Net, it is sufficient to compile the target peer with the customized AFL++ compiler pass we ship in TODO, which we use to record the coverage feedback. This feedback guides our mutations of the weird peer.
 
 # Preparing the Runtime Environment (Docker Image)
-Before using Fuzztruction, the runtime environment that comes as a Docker image is required. This image can be obtained by building it yourself locally or pulling a pre-built version. Both ways are described in the following. Before preparing the runtime environment, this repository, and all sub repositories, must be cloned:
+Before using Fuzztruction-Net, the runtime environment that comes as a Docker image is required. This image can be obtained by building it yourself locally or pulling a pre-built version. Both ways are described in the following. Before preparing the runtime environment, this repository, and all sub repositories, must be cloned:
 ```bash
 git clone --recurse-submodules https://github.com/fuzztruction/fuzztruction-net.git
 ```
 
 ### ****Local Build****
-The Fuzztruction runtime environment can be built by executing [`env/build.sh`](./env/build.sh). This builds a Docker image containing a complete runtime environment for Fuzztruction-Net locally. By default, a [pre-built version](https://hub.docker.com/repository/docker/nbars/fuzztruction-llvm_debug) of our patched LLVM version is used and pulled from Docker Hub. If you want to use a locally built LLVM version, check the [`llvm`](https://github.com/fuzztruction/fuzztruction-llvm) directory.
+The Fuzztruction-Net runtime environment can be built by executing [`env/build.sh`](./env/build.sh). This builds a Docker image containing a complete runtime environment for Fuzztruction-Net locally. By default, a [pre-built version](https://hub.docker.com/repository/docker/nbars/fuzztruction-llvm_debug) of our patched LLVM version is used and pulled from Docker Hub. If you want to use a locally built LLVM version, check the [`llvm`](https://github.com/fuzztruction/fuzztruction-llvm) directory.
 
 ### ****Pre-built****
 In most cases, there is no particular reason for using the pre-built environment -- except if you want to reproduce the exact experiments conducted in the paper. The pre-built image provides everything, including the pre-built evaluation targets and all dependencies. The image can be retrieved by executing [`env/pull-prebuilt.sh`](./env/pull-prebuilt.sh).
@@ -109,7 +108,7 @@ Several files/folders are mounted from the host into the container to facilitate
 
 
 ## Runtime Environment Details
-This section details the runtime environment (Docker container) provided alongside Fuzztruction. The user in the container is named `user` and has passwordless `sudo` access per default.
+This section details the runtime environment (Docker container) provided alongside Fuzztruction-Net. The user in the container is named `user` and has passwordless `sudo` access per default.
 
 > <b><span style="color:red">Permissions:</span></b> The Docker images' user is named `user` and has the same User ID (UID) as the user who initially built the image. Thus, mounts from the host can be accessed inside the container. However, in the case of using the pre-built image, this might not be the case since the image was built on another machine. This must be considered when exchanging data with the host.
 
@@ -137,9 +136,9 @@ For building Fuzztruction-Net, it is sufficient to call `cargo build` in `/home/
 
 | Artifacts  |  Description  |
 |--:|---|
-|`./generator/pass/fuzztruction-source-llvm-pass.so` | The LLVM pass is used to insert the patch points into the generator application. <b><span style="color:red">Note:</span></b> The location of the pass is recorded in `/etc/ld.so.conf.d/fuzztruction.conf`; thus, compilers are able to find the pass during compilation. If you run into trouble because the pass is not found, please run `sudo ldconfig` and retry using a freshly spawned shell.  |
-| `./generator/pass/fuzztruction-source-clang-fast`  | A compiler wrapper for compiling the generator application. This wrapper uses our custom compiler pass, links the targets against the agent, and injects a call to the agents' init method into the generator's main.  |
-| `./target/debug/libgenerator_agent.so`  | The agent the is injected into the generator application.  |
+|`./generator/pass/fuzztruction-source-llvm-pass.so` | The LLVM pass is used to insert the patch points into the weird peer. <b><span style="color:red">Note:</span></b> The location of the pass is recorded in `/etc/ld.so.conf.d/fuzztruction.conf`; thus, compilers are able to find the pass during compilation. If you run into trouble because the pass is not found, please run `sudo ldconfig` and retry using a freshly spawned shell.  |
+| `./generator/pass/fuzztruction-source-clang-fast`  | A compiler wrapper for compiling the weird peer. This wrapper uses our custom compiler pass, links the targets against the agent, and injects a call to the agents' init method into the weird peer's main.  |
+| `./target/debug/libgenerator_agent.so`  | The agent the is injected into the weird peer.  |
 | `./target/debug/fuzztruction`  | The fuzztruction binary representing the actual fuzzer. |
 
 ## Fuzzing a Target using Fuzztruction-Net
@@ -160,9 +159,9 @@ allows testing whether the target works. Each target is defined using a `YAML` c
 ### **Troubleshooting**
 If the fuzzer terminates with an error, there are multiple ways to assist your debugging efforts.
 
-- Passing `--log-output` to `fuzztruction` causes stdout/stderr of the generator and the consumer if they are not used for passing or reading data from each other to be written into files in the working directory.
-- Setting AFL_DEBUG in the `env` section of the `sink` in the `YAML` config can give you a more detailed output regarding the consumer.
-- Executing the generator and consumer using the same flags as in the config file might reveal any typo in the command line used to execute the application. In the case of using `LD_PRELOAD`, double check the provided paths.
+- Passing `--log-output` to `fuzztruction` causes stdout/stderr of the weird peer and the target peer if they are not used for passing or reading data from each other to be written into files in the working directory.
+- Setting AFL_DEBUG in the `env` section of the `sink` in the `YAML` config can give you a more detailed output regarding the target peer.
+- Executing the weird peer and target peer using the same flags as in the config file might reveal any typo in the command line used to execute the application. In the case of using `LD_PRELOAD`, double check the provided paths.
 
 ### **Running the Fuzzer**
 To start the fuzzing process, executing the following command is sufficient:
