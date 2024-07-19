@@ -15,9 +15,16 @@ function yes_no() {
     fi
 }
 
-container="$(docker ps --filter="name=$CONTAINER_NAME" --latest --quiet)"
+if use_prebuilt; then
+    container_name=$PREBUILT_CONTAINER_NAME
+else
+    container_name=$CONTAINER_NAME
+fi
+
+
+container="$(docker ps --filter="name=^/$container_name$" --latest --quiet)"
 if [[ -n "$container" ]]; then
-    # Connec to already running container
+    # Connect to already running container
     log_success "[+] Found running instance: $container, connecting..."
     cmd="docker start $container"
     log_success "[+] $cmd"
@@ -61,7 +68,7 @@ cmd="docker run -ti -d --privileged
     --ulimit msgqueue=2097152000
     --shm-size=64G
     --net=host
-    --name $CONTAINER_NAME
+    --name $container_name
     --env "PREBUILT_ENV_VAR_NAME=$PREBUILT_ENV_VAR_NAME"
     --env "$PREBUILT_ENV_VAR_NAME=${!PREBUILT_ENV_VAR_NAME:-}" "
 

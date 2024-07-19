@@ -7,7 +7,14 @@ cd $(dirname $0)
 source config.sh
 cd ..
 
-container="$(docker ps --filter="name=$CONTAINER_NAME" --latest --quiet)"
+if use_prebuilt; then
+    container_name=$PREBUILT_CONTAINER_NAME
+else
+    container_name=$CONTAINER_NAME
+fi
+
+
+container="$(docker ps --filter="name=^/$container_name$" --latest --quiet)"
 if [[ -n "$container" ]]; then
     echo "Found running instance $container, stopping..."
     cmd="docker stop -t 5 $container"
