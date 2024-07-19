@@ -14,12 +14,12 @@ members = [
     "generator/agent",
     "lib/proc-maps",
     "lib/jail",
-    "lib/compute_coverage",
 ]
 
 exclude = [
     "lib/llvm-stackmap-rs",
-    "lib/llvm-cov-json"
+    "lib/llvm-cov-json",
+    "lib/compute_coverage",
 ]
 
 [workspace.dependencies]

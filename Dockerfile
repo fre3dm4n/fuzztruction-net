@@ -42,7 +42,7 @@ ENV LANG=en_US.UTF-8
 
 # Install AFL++
 COPY consumer /consumer
-RUN cd /consumer/aflpp-consumer && make clean && make all && make install
+RUN LLVM_CONFIG=llvm-config cd /consumer/aflpp-consumer && make clean && make all && make install
 
 # Make sure the loader finds our agent library.
 COPY data/ld_fuzztruction.conf /etc/ld.so.conf.d/fuzztruction.conf
@@ -79,9 +79,9 @@ RUN cd /tmp && \
 COPY env/check_env.sh /usr/bin/
 
 # depot tools needed for webrtc()
-RUN cd / && git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
-ENV PATH "$PATH:/depot_tools"
-RUN chown user:user -R /depot_tools
+# RUN cd / && git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+# ENV PATH "$PATH:/depot_tools"
+# RUN chown user:user -R /depot_tools
 
 USER user
 #RUN wget -O ~/.gdbinit-gef.py -q https://gef.blah.cat/py \
@@ -93,7 +93,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y --
 ENV PATH="/home/user/.cargo/bin:${PATH}"
 
 RUN cd /tmp && \
-    sh -c "$(wget -O- https://raw.githubusercontent.com/deluan/zsh-in-docker/master/zsh-in-docker.sh)" -- \
+    sh -c "$(wget -O- -4 https://raw.githubusercontent.com/deluan/zsh-in-docker/master/zsh-in-docker.sh)" -- \
     -t agnoster
 
 # Install rr
@@ -160,3 +160,29 @@ RUN sudo chown -R user:user /home/user && \
     chmod 600 /home/user/.ssh/authorized_keys
 
 RUN sudo apt purge ccache -y
+
+
+FROM dev as prebuilt
+
+USER user
+RUN mkdir /home/user/fuzztruction
+WORKDIR /home/user/fuzztruction
+
+RUN mkdir -p lib
+COPY --chown=user:user ./lib/proc-maps ./lib/proc-maps
+COPY --chown=user:user ./lib/jail ./lib/jail
+
+COPY --chown=user:user Cargo.lock Cargo.lock
+COPY --chown=user:user Cargo.toml Cargo.toml
+COPY --chown=user:user ./generator ./generator
+COPY --chown=user:user ./consumer ./consumer
+COPY --chown=user:user ./scheduler ./scheduler
+COPY --chown=user:user ./fuzztruction_shared ./fuzztruction_shared
+
+RUN mkdir -p fuzztruction-experiments/comparison-with-state-of-the-art/binaries/networked
+RUN mkdir -p fuzztruction-experiments/comparison-with-state-of-the-art/configurations/networked
+COPY --chown=user:user fuzztruction-experiments/comparison-with-state-of-the-art/eval fuzztruction-experiments/comparison-with-state-of-the-art/eval
+COPY --chown=user:user fuzztruction-experiments/comparison-with-state-of-the-art/binaries/networked fuzztruction-experiments/comparison-with-state-of-the-art/binaries/networked
+COPY --chown=user:user fuzztruction-experiments/comparison-with-state-of-the-art/configurations/networked fuzztruction-experiments/comparison-with-state-of-the-art/configurations/networked
+
+RUN cargo build --workspace --release

@@ -486,21 +486,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "coverage"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "fuzztruction_shared",
- "glob",
- "indicatif",
- "lazy_static",
- "rand",
- "rayon",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1070,7 +1055,6 @@ dependencies = [
  "instant",
  "number_prefix",
  "portable-atomic",
- "rayon",
  "unicode-width",
 ]
 
