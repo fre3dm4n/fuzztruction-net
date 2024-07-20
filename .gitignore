@@ -26,7 +26,6 @@ chromium_quic_kMaxIncomingPacketSize_rr
 #networked-binaries
 lib/network-fuzzing-introspection
 consumer/aflpp-consumer
-lib/gdbinit-gef.py
 lib/gef-plugins/
 lib/pernosco-submit/
 lib/cat-replayable/

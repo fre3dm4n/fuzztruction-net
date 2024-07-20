@@ -16,8 +16,8 @@ old_fuzztruction-experiments
 #fuzztruction-experiments/comparison-with-state-of-the-art/eval/
 #fuzztruction-experiments/comparison-with-state-of-the-art/binaries
 fuzztruction-experiments/comparison-with-state-of-the-art/eval/artifact-results
+fuzztruction-experiments/comparison-with-state-of-the-art/eval/eval/artifact-results-test
 fuzztruction-experiments/comparison-with-state-of-the-art/eval/results
-fuzztruction-experiments/comparison-with-state-of-the-art/eval/results/venv
 fuzztruction-experiments/comparison-with-state-of-the-art/eval/coverage_stats.txt
 fuzztruction-experiments/comparison-with-state-of-the-art/eval/bugs.py
 fuzztruction-experiments/comparison-with-state-of-the-art/eval/queue_plot.py

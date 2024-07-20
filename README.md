@@ -24,8 +24,12 @@ For instructions on how to reproduce the experiments from our paper, please read
 
 ## Quickstart
 ```bash
-# Clone the repository
-git clone --recurse-submodules https://github.com/fuzztruction/fuzztruction-net.git
+# Clone the repository. This is required to be placed at your user's
+# home directory, if you are planning to replicate our evaluation via the
+# scripts provided in the fuzztruction-experiments submodule.
+git clone https://github.com/fuzztruction/fuzztruction-net.git && \
+    cd fuzztruction-net && \
+    git submodule update --init
 
 # Option 1: Get a pre-built version of our runtime environment.
 # To ease reproduction of experiments in our paper, we recommend using our
