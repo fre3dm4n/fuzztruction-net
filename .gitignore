@@ -19,7 +19,7 @@ eval-results
 **/*.til
 
 # python stuff
-__pycache__
+**/__pycache__
 
 chromium_quic_kMaxIncomingPacketSize_rr
 #eval
