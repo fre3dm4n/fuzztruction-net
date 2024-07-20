@@ -22,8 +22,8 @@ eval-results
 __pycache__
 
 chromium_quic_kMaxIncomingPacketSize_rr
-eval
-networked-binaries
+#eval
+#networked-binaries
 lib/network-fuzzing-introspection
 consumer/aflpp-consumer
 lib/gdbinit-gef.py

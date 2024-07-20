@@ -29,7 +29,7 @@ git clone --recurse-submodules https://github.com/fuzztruction/fuzztruction-net.
 
 # Option 1: Get a pre-built version of our runtime environment.
 # To ease reproduction of experiments in our paper, we recommend using our
-# pre-built environment to avoid incompatibilities (~30 GB of data will be
+# pre-built environment to avoid incompatibilities (~80 GB of data will be
 # downloaded)
 # Do NOT use this if you don't want to reproduce our results but instead fuzz
 # own targets (use the next command instead).

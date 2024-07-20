@@ -185,4 +185,7 @@ COPY --chown=user:user fuzztruction-experiments/comparison-with-state-of-the-art
 COPY --chown=user:user fuzztruction-experiments/comparison-with-state-of-the-art/binaries/networked fuzztruction-experiments/comparison-with-state-of-the-art/binaries/networked
 COPY --chown=user:user fuzztruction-experiments/comparison-with-state-of-the-art/configurations/networked fuzztruction-experiments/comparison-with-state-of-the-art/configurations/networked
 
+COPY --chown=user:user ./networked-binaries ./networked-binaries
+COPY --chown=user:user ./eval ./eval
+
 RUN cargo build --workspace --release
