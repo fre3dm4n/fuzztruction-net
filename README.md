@@ -1,5 +1,6 @@
 # Fuzztruction-Net
-<p><a href="https://mschloegel.me/paper/bars2024fuzztructionnet.pdf"><img alt="Fuzztruction-Net Paper Thumbnail" align="right" width="320" src="https://user-images.githubusercontent.com/1810786/204243236-9d0ddd3b-82c2-4b82-9859-d93ded3ea7e7.png"></a></p>
+<p><a href="https://mschloegel.me/paper/bars2024fuzztructionnet.pdf"><img alt="Fuzztruction-Net Paper Thumbnail" align="right" width="320" src="https://github.com/user-attachments/assets/04904703-ded2-4a97-a185-6b35df84fe9e"></a></p>
+
 
 Fuzztruction-Net is an academic prototype of a fuzzer that does not directly mutate the input messages (as most other fuzzers do) sent to network applications under test, but it uses a fundamentally different approach that relies on *fault injection* instead. Effectively, we inject faults to force one of the communication peers into a weird state where its output no longer matches the expectations of the target peer, thereby potentially uncovering bugs. Importantly, this *weird peer* can still properly encrypt/sign the protocol messages, overcoming a fundamental challenge of current network application fuzzing. This is because we leave the communication system intact but introduce small corruptions. Since we can turn both the server or the client into a weird peer, our approach is the first capable of testing client-side network applications effectively.
 
