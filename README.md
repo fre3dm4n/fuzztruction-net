@@ -105,7 +105,7 @@ After building or pulling a pre-built version of the runtime environment, the fu
 | Script | Description |
 |--|---|
 | [`./env/start.sh`](./env/start.sh)  | Spawn a new container or spawn a shell into an already running container. <b><span style="color:red">Prebuilt:</span></b> Exporting `USE_PREBUILT=1` spawns a container based on a pre-built environment. For switching from pre-build to local build or the other way around, `stop.sh` must be executed first.  |
-| [`./env/stop.sh`](./env/stop.sh)  | This stops the container. Remember to call this after rebuilding the image.  |
+| [`./env/stop.sh`](./env/stop.sh)  | This stops the container. Remember to call this after rebuilding the image. Same as for the `start.sh` script, `USE_PREBUILT=1` must be set as environment variable if the prebuilt runtime environment is used.  |
 
 Using [`start.sh`](./env/start.sh), an arbitrary number of shells can be spawned in the container. Using Visual Studio Codes' [Containers](https://code.visualstudio.com/docs/remote/containers) extension allows you to work conveniently inside the Docker container.
 
