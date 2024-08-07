@@ -1,9 +1,9 @@
 # ARG PREBUILT_LLVM_IMAGE=nbars/fuzztruction-llvm_debug:eb1d5065c560b3468fa0d34af3103359cd78c088
 ARG PREBUILT_LLVM_IMAGE=nbars/fuzztruction-llvm_debug:llvmorg-17.0.6
 
-FROM ${PREBUILT_LLVM_IMAGE} as llvm
+FROM ${PREBUILT_LLVM_IMAGE} AS llvm
 
-FROM ubuntu:23.04 as dev
+FROM ubuntu:23.04 AS dev
 ENV DEBIAN_FRONTEND noninteractive
 # ENV CCACHE_DIR=/ccache
 # ENV CCACHE_MAXSIZE=25G
@@ -162,7 +162,7 @@ RUN sudo chown -R user:user /home/user && \
 RUN sudo apt purge ccache -y
 
 
-FROM dev as prebuilt
+FROM dev AS prebuilt
 
 USER user
 RUN mkdir /home/user/fuzztruction
