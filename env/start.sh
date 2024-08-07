@@ -44,6 +44,7 @@ touch "$PWD/data/bash_history"
 touch "$PWD/data/zsh_history"
 mkdir -p "$PWD/data/ccache"
 mkdir -p "$PWD/data/vscode-data"
+mkdir -p "$PWD/eval-result"
 
 log_success "[+] Creating new container..."
 
@@ -64,6 +65,7 @@ cmd="docker run -ti -d --privileged
     -v $PWD/data/init.vim:/home/user/.config/nvim/init.vim
     -v $PWD/data/ccache:/ccache
     -v $PWD/data/vscode-data:/home/user/.config/Code
+    -v $PWD/eval-result:/home/user/fuzztruction/eval-result
     --mount type=tmpfs,destination=/tmp,tmpfs-mode=777
     --ulimit msgqueue=2097152000
     --shm-size=64G
