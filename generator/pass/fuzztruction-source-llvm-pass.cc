@@ -766,6 +766,9 @@ bool FuzztructionSourcePass::injectPatchPoints(Module &M) {
     auto allowlisted_functions = parse_env_var_list("FT_FUNCTION_ALLOWLIST");
     dbgs() << "allowlisted_functions: " << allowlisted_functions.size() << "\n";
 
+    auto blocklisted_functions = parse_env_var_list("FT_FUNCTION_BLOCKLIST");
+    dbgs() << "blocklisted_functions: " << blocklisted_functions.size() << "\n";
+
     auto allowlisted_files = parse_env_var_list("FT_FILE_ALLOWLIST");
     dbgs() << "allowlisted_files: " << allowlisted_files.size() << "\n";
 
@@ -783,26 +786,6 @@ bool FuzztructionSourcePass::injectPatchPoints(Module &M) {
         if (std::find(blocklisted_files.begin(), blocklisted_files.end(), M.getSourceFileName()) != blocklisted_files.end()) {
             dbgs() << "FT: Skipping blockedlisted file " << M.getSourceFileName() << "\n";
             return modified;
-        }
-    }
-
-    auto allowlisted_files = parse_env_var_list("FT_FILE_ALLOWLIST");
-    dbgs() << "allowlisted_files: " << allowlisted_files.size() << "\n";
-
-    auto blocklisted_files = parse_env_var_list("FT_FILE_BLOCKLIST");
-    dbgs() << "blocklisted_files: " << blocklisted_files.size() << "\n";
-
-    if (allowlisted_files.size() > 0) {
-        if (std::find(allowlisted_files.begin(), allowlisted_files.end(), M.getSourceFileName()) != allowlisted_files.end()) {
-            dbgs() << "FT: File is listed as allowed " << M.getSourceFileName() << "\n";
-        } else {
-            dbgs() << "FT: File is not on the allow list " << M.getSourceFileName() << "\n";
-            return false;
-        }
-    } else {
-        if (std::find(blocklisted_files.begin(), blocklisted_files.end(), M.getSourceFileName()) != blocklisted_files.end()) {
-            dbgs() << "FT: Skipping blockedlisted file " << M.getSourceFileName() << "\n";
-            return false;
         }
     }
 

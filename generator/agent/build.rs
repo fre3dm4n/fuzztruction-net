@@ -19,5 +19,6 @@ fn build_llvm_pass() {
     let mut cmd = process::Command::new("make");
     let cwd = PathBuf::from(manifest_dir).join("../pass");
     cmd.current_dir(cwd);
-    cmd.spawn().unwrap();
+    let mut ret = cmd.spawn().unwrap();
+    ret.wait().unwrap();
 }
