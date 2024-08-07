@@ -154,11 +154,18 @@ We will use `dropbear` as an example to showcase Fuzztruction-Net's capabilities
 Switch into the `fuzztruction-experiments/comparison-with-state-of-the-art/binaries/networked` directory and execute `./build.sh libpng src deps generator consumer`. This will pull the source and start the build according to the steps defined in `libpng/config.sh`.
 
 ### **Benchmarking the Target**
-Using the following command
+Using the following command (see note regarding the choice between debug and release)
 ```bash
+# If built with in debug mode (default)
 sudo ./target/debug/fuzztruction ./fuzztruction-experiments/comparison-with-state-of-the-art/configurations/networked/dropbear/dbclient_dropbear.yml --purge --log-output benchmark -i 25
+# If built in release mode or using the prebuilt image
+sudo ./target/release/fuzztruction ./fuzztruction-experiments/comparison-with-state-of-the-art/configurations/networked/dropbear/dbclient_dropbear.yml --purge --log-output benchmark -i 25
 ```
 allows testing whether the target works. Each target is defined using a `YAML` configuration file. The files are located in the `configurations/networked` directory and are a good starting point for building your own config. The `dbclient_dropbear.yml` file is extensively documented.
+
+> [!NOTE]
+> You need to choose one of debug or release (second component of the path), depending on the whether you passed `--release` to `cargo build` or not.
+> If you are using the prebuilt image, this must be set to release.
 
 
 ### **Troubleshooting**
@@ -171,7 +178,10 @@ If the fuzzer terminates with an error, there are multiple ways to assist your d
 ### **Running the Fuzzer**
 To start the fuzzing process, executing the following command is sufficient:
 ```bash
+# For debug builds.
 sudo ./target/debug/fuzztruction ./fuzztruction-experiments/comparison-with-state-of-the-art/configurations/networked/dropbear/dbclient_dropbear.yml fuzz -j 10 -t 10m
+# For release builds or if using the prebuilt image.
+sudo ./target/release/fuzztruction ./fuzztruction-experiments/comparison-with-state-of-the-art/configurations/networked/dropbear/dbclient_dropbear.yml fuzz -j 10 -t 10m
 ```
 This will start a fuzzing run on 10 cores, with a timeout of 10 minutes. Output produced by the fuzzer is stored in the directory defined by the `work-directory` attribute in the target's config file. In case of `dropbear`, the default location is `/tmp/dclient-dropbear-1`.
 
