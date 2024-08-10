@@ -102,10 +102,17 @@ fn check_if_agent_is_in_path() -> Result<()> {
 }
 
 fn check_scaling_governor() -> Result<()> {
-    let governor = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")?;
-    if governor.trim() != "performance" {
-        return Err(anyhow!("Please run echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"));
+    let governor = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+    if let Ok(governor) = governor {
+        if governor.trim() != "performance" {
+            return Err(anyhow!("Please run echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"));
+        }
+    } else {
+        log::warn!(
+            "Failed to set governor. Probably this is not supported by this system: {governor:#?}"
+        );
     }
+
     Ok(())
 }
 
@@ -121,7 +128,11 @@ fn check_file_limit() -> Result<()> {
 
 fn check_mqueue_queues_max() -> Result<()> {
     let procfs_file = "/proc/sys/fs/mqueue/queues_max";
-    let limit: u64 = fs::read_to_string(procfs_file)?.trim().parse().unwrap();
+    let limit: u64 = fs::read_to_string(procfs_file)
+        .context(format!("Failed to read {procfs_file}"))?
+        .trim()
+        .parse()
+        .unwrap();
     if limit < 1024 {
         fs::write(procfs_file, "1024").unwrap();
     }
