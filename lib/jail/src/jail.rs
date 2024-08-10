@@ -134,8 +134,12 @@ impl Jail {
             Jail::remount_bind_mount_ro(&dst).context("Failed to remount as ro")?;
         }
 
-        let dst = format!("{}{}", &self.new_root, "/home/user/fuzztruction/eval-result");
-        Jail::mount(&["--bind",  "/home/user/fuzztruction/eval-result", &dst]).context("Failed to mount eval-result RW")?;
+        let dst = format!(
+            "{}{}",
+            &self.new_root, "/home/user/fuzztruction/eval-result"
+        );
+        Jail::mount(&["--bind", "/home/user/fuzztruction/eval-result", &dst])
+            .context("Failed to mount eval-result RW")?;
 
         // Mount /proc, /sys and /dev. These are shared since they are also marked as shared in the "parent" namespace.
         Jail::mount(&["-o", "bind", "/proc", &format!("{}/proc", self.new_root)])

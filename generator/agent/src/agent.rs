@@ -1,4 +1,3 @@
-
 use fuzztruction_shared::messages;
 use fuzztruction_shared::{
     communication_channel::{CommunicationChannel, CommunicationChannelError},

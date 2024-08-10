@@ -4,7 +4,10 @@ use std::{
 };
 
 use crate::{
-    config::Config, constants::MAX_WORKER_RESTART_CNT, fuzzer::event_counter::FuzzerEventCounter, sink_bitmap::{Bitmap, BITMAP_DEFAULT_MAP_SIZE}
+    config::Config,
+    constants::MAX_WORKER_RESTART_CNT,
+    fuzzer::event_counter::FuzzerEventCounter,
+    sink_bitmap::{Bitmap, BITMAP_DEFAULT_MAP_SIZE},
 };
 
 use anyhow::Result;
@@ -193,7 +196,7 @@ impl FuzzingCampaign {
 
         for worker in self.workers.iter() {
             let worker_uid = worker.uid();
-            if !worker.is_alive() && ! self.restarted_worker.contains(&worker_uid) {
+            if !worker.is_alive() && !self.restarted_worker.contains(&worker_uid) {
                 log::warn!("Worker {:?} has crashed and will be restarted.", worker_uid);
                 crashed_workers.push(worker_uid);
             }

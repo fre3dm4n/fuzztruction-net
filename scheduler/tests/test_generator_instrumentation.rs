@@ -1,7 +1,13 @@
 use std::{path::PathBuf, str::FromStr, sync::Mutex, time::Duration};
 
 use rand::{rngs::StdRng, RngCore, SeedableRng};
-use scheduler::{io_channels::{InputChannel, OutputChannel}, logging::setup_logger, mutation_cache::MutationCache, mutation_cache_ops::MutationCacheOpsEx, source::{RunResult, Source}};
+use scheduler::{
+    io_channels::{InputChannel, OutputChannel},
+    logging::setup_logger,
+    mutation_cache::MutationCache,
+    mutation_cache_ops::MutationCacheOpsEx,
+    source::{RunResult, Source},
+};
 
 fn tests_path() -> PathBuf {
     let mut path = PathBuf::from_str(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -11,18 +17,26 @@ fn tests_path() -> PathBuf {
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-
 #[allow(clippy::read_zero_byte_vec)]
 fn test_instrumentation(workdir: PathBuf, total_size: usize, access_size_bits: usize) {
-
-
     let tests_path = tests_path();
     let mut bin_path = tests_path.clone();
     bin_path.push("target_1/generator");
 
     let access_total_size = total_size;
 
-    let mut source = Source::new(bin_path, vec![access_total_size.to_string()], workdir, InputChannel::None, OutputChannel::Stdout, true, false, true, None).unwrap();
+    let mut source = Source::new(
+        bin_path,
+        vec![access_total_size.to_string()],
+        workdir,
+        InputChannel::None,
+        OutputChannel::Stdout,
+        true,
+        false,
+        true,
+        None,
+    )
+    .unwrap();
 
     source.start().unwrap();
     let mut patch_points = Vec::clone(&source.get_patchpoints().unwrap());
@@ -30,9 +44,11 @@ fn test_instrumentation(workdir: PathBuf, total_size: usize, access_size_bits: u
     assert!(access_size_bits <= 8);
 
     unsafe {
-        patch_points.get_mut(0).unwrap().set_target_value_size_in_bits(access_size_bits as u32);
+        patch_points
+            .get_mut(0)
+            .unwrap()
+            .set_target_value_size_in_bits(access_size_bits as u32);
     }
-
 
     let target_patch_point = patch_points.get(0).unwrap().clone();
 
@@ -47,7 +63,10 @@ fn test_instrumentation(workdir: PathBuf, total_size: usize, access_size_bits: u
 
     let hits = trace.hits_mapping();
     assert_eq!(hits.len(), 1);
-    assert_eq!(*hits.get(&target_patch_point.id()).unwrap(), access_total_size as u64);
+    assert_eq!(
+        *hits.get(&target_patch_point.id()).unwrap(),
+        access_total_size as u64
+    );
 
     // enable the patch point
     let mc = source.mutation_cache();
@@ -71,15 +90,20 @@ fn test_instrumentation(workdir: PathBuf, total_size: usize, access_size_bits: u
         eprintln!("msk: {:?}", msk);
 
         source.spawn(DEFAULT_TIMEOUT).unwrap();
-        source.wait_for_child_termination(DEFAULT_TIMEOUT, false).unwrap();
+        source
+            .wait_for_child_termination(DEFAULT_TIMEOUT, false)
+            .unwrap();
         let mut output = Vec::<u8>::new();
         source.read(&mut output);
 
         let output = String::from_utf8(output).unwrap();
-        let lines = output.lines().map(|line| u8::from_str_radix(line, 16).unwrap()).collect::<Vec<_>>();
+        let lines = output
+            .lines()
+            .map(|line| u8::from_str_radix(line, 16).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(lines.len(), access_total_size);
 
-        let mut  bit_idx = 0usize;
+        let mut bit_idx = 0usize;
 
         for line in lines.into_iter().enumerate() {
             eprintln!("line: {:?}", line);
@@ -98,17 +122,14 @@ fn test_instrumentation(workdir: PathBuf, total_size: usize, access_size_bits: u
             }
             bit_idx += access_size_bits;
         }
-
     }
 }
 
-
 static LOGGING_SETUP_DONE: Mutex<bool> = Mutex::new(false);
-
 
 fn setup_logging(log_path: PathBuf) {
     let mut lock = LOGGING_SETUP_DONE.lock().unwrap();
-    if ! *lock {
+    if !*lock {
         *lock = true;
         setup_logger(&log_path, "trace").unwrap();
     }
@@ -124,7 +145,7 @@ fn test_instrumentation_bytes_all() {
     log_path.push("log.txt");
     setup_logging(log_path);
 
-    for n in [1, 2, 3, 4, 5, 6, 7, 8, 9, 100, 120, 500, 1024, 5555, 10000]{
+    for n in [1, 2, 3, 4, 5, 6, 7, 8, 9, 100, 120, 500, 1024, 5555, 10000] {
         test_instrumentation(workdir.clone(), n, 8);
     }
 }
@@ -139,7 +160,7 @@ fn test_instrumentation_bits_all() {
     log_path.push("log.txt");
     setup_logging(log_path);
 
-    for n in [1, 2, 3, 4, 5, 6, 7, 8, 9, 100, 120, 500, 1024, 5555, 10000]{
+    for n in [1, 2, 3, 4, 5, 6, 7, 8, 9, 100, 120, 500, 1024, 5555, 10000] {
         for access_size in 1..7 {
             test_instrumentation(workdir.clone(), n, access_size);
         }

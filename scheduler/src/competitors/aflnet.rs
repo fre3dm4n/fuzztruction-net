@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use crate::config::{Config};
+use crate::config::Config;
 use anyhow::Result;
 use itertools::Itertools;
 

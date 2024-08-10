@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct LogRecordWrapper {
     pub level: log::Level,

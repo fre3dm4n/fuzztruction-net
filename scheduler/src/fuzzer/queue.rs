@@ -616,24 +616,24 @@ impl Queue {
         //let pool = rayon::ThreadPoolBuilder::new().num_threads(MAX_QUEUE_DUMP_THREADS).build().unwrap();
 
         //pool.install(|| {
-            self.entries().par_iter().for_each(|entry| {
-                let mut entry_path = path.to_owned();
-                entry_path.push(format!("{}.zlib", entry.id().0));
+        self.entries().par_iter().for_each(|entry| {
+            let mut entry_path = path.to_owned();
+            entry_path.push(format!("{}.zlib", entry.id().0));
 
-                if entry_path.exists() {
-                    // Was already dumped.
-                } else {
-                    let mut file = OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .open(entry_path)
-                        .unwrap();
-                    let mut compressor = ZlibEncoder::new(Vec::new(), Compression::default());
-                    serde_json::to_writer_pretty(&mut compressor, &entry).unwrap();
-                    let compressed_bytes = compressor.finish().unwrap();
-                    file.write_all(&compressed_bytes).unwrap();
-                }
-            });
+            if entry_path.exists() {
+                // Was already dumped.
+            } else {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(entry_path)
+                    .unwrap();
+                let mut compressor = ZlibEncoder::new(Vec::new(), Compression::default());
+                serde_json::to_writer_pretty(&mut compressor, &entry).unwrap();
+                let compressed_bytes = compressor.finish().unwrap();
+                file.write_all(&compressed_bytes).unwrap();
+            }
+        });
         //});
 
         Ok(())

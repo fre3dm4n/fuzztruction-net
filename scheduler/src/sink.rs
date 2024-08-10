@@ -366,7 +366,7 @@ impl AflSink {
                     }
                 }
                 if ready_fds.is_empty() {
-                    return Err(SinkError::FatalError("Error during sink execution: Poll returned but no fd is ready, this means that some fd got into an unexpected error state".to_string()).into())
+                    return Err(SinkError::FatalError("Error during sink execution: Poll returned but no fd is ready, this means that some fd got into an unexpected error state".to_string()).into());
                 }
                 Ok(ready_fds)
             }

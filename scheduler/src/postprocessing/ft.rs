@@ -72,8 +72,7 @@ pub fn ft_reproduce_crashes(
     let mut source = Source::from_config(config, None, Some("crash-reproduce")).unwrap();
     // let mut sink =
     //     AflSink::from_config_crash_repro(config, None, Some("crash-reproduce"), enable_rr).unwrap();
-    let mut sink =
-         AflSink::from_config(config, None, Some("crash-reproduce")).unwrap();
+    let mut sink = AflSink::from_config(config, None, Some("crash-reproduce")).unwrap();
     source.start().expect("Failed to start source");
     sink.start().expect("Failed to start sink");
 

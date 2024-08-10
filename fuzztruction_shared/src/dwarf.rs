@@ -193,7 +193,6 @@ impl DwarfReg {
     }
 
     pub fn name_with_size(&self, size: u8) -> Option<String> {
-
         const XMM0_ID: u16 = DwarfReg::Xmm0 as u16;
         const XMM15_ID: u16 = DwarfReg::Xmm15 as u16;
 

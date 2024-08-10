@@ -1,6 +1,6 @@
 #![allow(clippy::type_complexity)]
 
-use byte_unit::{n_mib_bytes};
+use byte_unit::n_mib_bytes;
 use fuzztruction_shared::{
     aux_messages::{AuxStreamMessage, AuxStreamType},
     aux_stream::AuxStreamAssembler,
