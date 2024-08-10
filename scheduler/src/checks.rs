@@ -141,14 +141,14 @@ fn check_mqueue_queues_max() -> Result<()> {
 
 /// Check if all requirements to run this software are satisfied.
 pub fn check_system() -> Result<()> {
-    check_core_pattern_is_core()?;
-    check_fs_suid_dumpable()?;
-    check_if_tmp_is_tmpfs()?;
-    check_if_agent_is_in_path()?;
-    check_scaling_governor()?;
-    check_perf_event_paranoid()?;
-    check_file_limit()?;
-    check_mqueue_queues_max()?;
+    check_core_pattern_is_core().context("check_core_pattern_is_core failed")?;
+    check_fs_suid_dumpable().context("check_fs_suid_dumpable failed")?;
+    check_if_tmp_is_tmpfs().context("check_if_tmp_is_tmpfs failed")?;
+    check_if_agent_is_in_path().context("check_if_agent_is_in_path failed")?;
+    check_scaling_governor().context("check_scaling_governor failed")?;
+    check_perf_event_paranoid().context("check_perf_event_paranoid failed")?;
+    check_file_limit().context("check_file_limit failed")?;
+    check_mqueue_queues_max().context("check_mqueue_queues_max failed")?;
     Ok(())
 }
 
