@@ -171,6 +171,7 @@ WORKDIR /home/user/fuzztruction
 RUN mkdir -p lib
 COPY --chown=user:user ./lib/proc-maps ./lib/proc-maps
 COPY --chown=user:user ./lib/jail ./lib/jail
+COPY --chown=user:user ./lib/asan_symbolize.py ./lib/asan_symbolize.py
 
 COPY --chown=user:user Cargo.lock Cargo.lock
 COPY --chown=user:user Cargo.toml Cargo.toml
