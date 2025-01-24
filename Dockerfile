@@ -3,7 +3,7 @@ ARG PREBUILT_LLVM_IMAGE=nbars/fuzztruction-llvm_debug:llvmorg-17.0.6
 
 FROM ${PREBUILT_LLVM_IMAGE} AS llvm
 
-FROM ubuntu:23.04 AS dev
+FROM ubuntu:24.04 AS dev
 ENV DEBIAN_FRONTEND noninteractive
 # ENV CCACHE_DIR=/ccache
 # ENV CCACHE_MAXSIZE=25G
